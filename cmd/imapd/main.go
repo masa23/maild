@@ -7,7 +7,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/mail"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -188,10 +190,10 @@ func (s *Session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	// 基本情報を構築
 	data := &imap.SelectData{
 		Flags: []imap.Flag{
-			//imap.FlagSeen, imap.FlagDeleted, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDraft,
+			imap.FlagSeen, imap.FlagDeleted, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDraft,
 		},
 		PermanentFlags: []imap.Flag{
-			//imap.FlagSeen, imap.FlagDeleted,
+			imap.FlagSeen, imap.FlagDeleted,
 		},
 		NumMessages: numMessages,
 		UIDNext:     uidNext,
@@ -301,23 +303,35 @@ func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 			if flag == imap.FlagDeleted {
 				// 削除フラグ付きのメールを検索
 				// いったん空を返してみる
-				return nil, &imap.Error{
-					Code: imap.ResponseCodeNonExistent,
-				}
+				return &imap.SearchData{
+					UID:   true,
+					All:   imap.SeqSetNum(),
+					Min:   0,
+					Max:   0,
+					Count: 0,
+				}, nil
 			}
 			if flag == imap.FlagAnswered {
 				// 返信済みのメールを検索
 				// いったん空を返してみる
-				return nil, &imap.Error{
-					Code: imap.ResponseCodeNonExistent,
-				}
+				return &imap.SearchData{
+					UID:   true,
+					All:   imap.SeqSetNum(),
+					Min:   0,
+					Max:   0,
+					Count: 0,
+				}, nil
 			}
 			if flag == imap.FlagDraft {
 				// 下書きのメールを検索
 				// いったん空を返してみる
-				return nil, &imap.Error{
-					Code: imap.ResponseCodeNonExistent,
-				}
+				return &imap.SearchData{
+					UID:   true,
+					All:   imap.SeqSetNum(),
+					Min:   0,
+					Max:   0,
+					Count: 0,
+				}, nil
 			}
 		}
 
@@ -343,7 +357,12 @@ func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 			maxID = 0
 		}
 
-		seqnum := imap.SeqSetNum(100)
+		var ids []uint32
+		if err := db.Model(&model.MessageMetaData{}).Where("user = ?", s.username).Pluck("id", &ids).Error; err != nil {
+			return nil, err
+		}
+
+		seqnum := imap.SeqSetNum(ids...)
 
 		return &imap.SearchData{
 			UID:   true,
@@ -393,79 +412,119 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 				Text: "FETCH only supports UIDSet",
 			}
 		*/
+		seq := set.(imap.SeqSet)
+		messages := []struct {
+			model  model.MessageMetaData
+			number uint32
+		}{}
+		for _, seqnum := range seq {
+			// seqnumは1:100の場合は、行頭から100件、200:300の場合は、201から300件を取得する
+			// stringからstartとendを取得
+			start := seqnum.Start
+			stop := seqnum.Stop
+			var m []model.MessageMetaData
+			if err := db.
+				Where("user = ?", s.username).
+				Offset(int(start - 1)).
+				Limit(int(stop - start + 1)).
+				Find(&m).Error; err != nil {
+				return err
+			}
+			for i, meta := range m {
+				messages = append(messages, struct {
+					model  model.MessageMetaData
+					number uint32
+				}{
+					model:  meta,
+					number: seqnum.Start + uint32(i),
+				})
+			}
+		}
+		// seqnumは1:100の場合は、行頭から100件、200:300の場合は、201から300件を取得する
+		// stringからstartとendを取得
+		for _, meta := range messages {
+			metaData := meta.model
+			log.Println(pp.Sprintf("Processing message ID: %d", metaData.ID))
+			name, mbox, host := mailparser.ParseAddress(metaData.FromRaw)
+			from := []imap.Address{
+				{
+					Mailbox: mbox,
+					Host:    host,
+					Name:    name,
+				},
+			}
+			name, mbox, host = mailparser.ParseAddress(metaData.ToRaw)
+			to := []imap.Address{
+				{
+					Mailbox: mbox,
+					Host:    host,
+					Name:    name,
+				},
+			}
+			name, mbox, host = mailparser.ParseAddress(metaData.CcRaw)
+			cc := []imap.Address{
+				{
+					Mailbox: mbox,
+					Host:    host,
+					Name:    name,
+				},
+			}
+			name, mbox, host = mailparser.ParseAddress(metaData.BccRaw)
+			bcc := []imap.Address{
+				{
+					Mailbox: mbox,
+					Host:    host,
+					Name:    name,
+				},
+			}
 
-		// 最新のメッセージを取得するために、UIDSetを仮に作成
-		var metaData model.MessageMetaData
-		if err := db.Where("user = ?", s.username).Last(&metaData).Error; err != nil {
-			return err
-		}
-		name, mbox, host := mailparser.ParseAddress(metaData.FromRaw)
-		from := []imap.Address{
-			{
-				Mailbox: mbox,
-				Host:    host,
-				Name:    name,
-			},
-		}
-		name, mbox, host = mailparser.ParseAddress(metaData.ToRaw)
-		to := []imap.Address{
-			{
-				Mailbox: mbox,
-				Host:    host,
-				Name:    name,
-			},
-		}
-		name, mbox, host = mailparser.ParseAddress(metaData.CcRaw)
-		cc := []imap.Address{
-			{
-				Mailbox: mbox,
-				Host:    host,
-				Name:    name,
-			},
-		}
-		name, mbox, host = mailparser.ParseAddress(metaData.BccRaw)
-		bcc := []imap.Address{
-			{
-				Mailbox: mbox,
-				Host:    host,
-				Name:    name,
-			},
+			msg := w.CreateMessage(meta.number)
+			msg.WriteEnvelope(&imap.Envelope{
+				Subject:   metaData.Subject,
+				From:      from,
+				To:        to,
+				Cc:        cc,
+				Bcc:       bcc,
+				MessageID: metaData.MessageID,
+				Date:      metaData.Timestamp,
+			})
+			body, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey)
+			if err != nil {
+				return err
+			}
+			// ヘッダーだけ取り出し
+			mm, err := mail.ReadMessage(body)
+			if err != nil {
+				return err
+			}
+			body.Close()
+
+			msg.WriteUID(imap.UID(metaData.ID))
+			msg.WriteRFC822Size(metaData.Size)
+			wr := msg.WriteBodySection(
+				&imap.FetchItemBodySection{
+					Specifier: imap.PartSpecifierHeader,
+					//HeaderFields: hf,
+				},
+				metaData.Size,
+			)
+
+			// ヘッダを書き込む
+			for k, v := range mm.Header {
+				if _, err := wr.Write([]byte(fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, ", ")))); err != nil {
+					return err
+				}
+			}
+			if _, err := wr.Write([]byte("\r\n")); err != nil {
+				return err
+			}
+
+			wr.Close()
+			if err := msg.Close(); err != nil {
+				return err
+			}
 		}
 
-		msg := w.CreateMessage(uint32(metaData.ID))
-		msg.WriteEnvelope(&imap.Envelope{
-			Subject:   metaData.Subject,
-			From:      from,
-			To:        to,
-			Cc:        cc,
-			Bcc:       bcc,
-			MessageID: metaData.MessageID,
-			Date:      metaData.Timestamp,
-		})
-		msg.WriteUID(imap.UID(metaData.ID))
-		msg.WriteRFC822Size(metaData.Size)
-		wr := msg.WriteBodySection(
-			&imap.FetchItemBodySection{
-				Specifier: imap.PartSpecifierText,
-			},
-			metaData.Size,
-		)
-
-		body, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey)
-		if err != nil {
-			return err
-		}
-		defer body.Close()
-		if _, err := io.Copy(wr, body); err != nil {
-			return err
-		}
-		if err := wr.Close(); err != nil {
-			return err
-		}
-
-		if err := msg.Close(); err != nil {
-			return err
-		}
 		return nil
 	}
 
@@ -550,6 +609,8 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 			return err
 		}
 		wr.Close()
+
+		time.Sleep(1 * time.Second)
 
 		if err := msg.Close(); err != nil {
 			return err
