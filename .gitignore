@@ -1,0 +1,4 @@
+config.yaml
+cmd/api/api
+cmd/imapd/imapd
+cmd/mailreceiver/mailreceiver
