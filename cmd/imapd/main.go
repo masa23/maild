@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/k0kubun/pp/v3"
 	"github.com/masa23/maild/config"
+	"github.com/masa23/maild/mailparser"
 	"github.com/masa23/maild/model"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -92,9 +94,14 @@ type Session struct {
 	username string
 }
 
+func (s *Session) SupportsIMAP4rev2() bool {
+	return true
+}
+
 func (s *Session) Login(username, password string) error {
 	log.Println(pp.Sprintf("Login called with username: %s", username))
 	// ToDo: 認証処理
+	s.username = "test@mail.masa23.jp"
 	return nil
 }
 
@@ -163,7 +170,10 @@ func (s *Session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	}
 	// メールボックスの未読メッセージ数をカウント
 	var unseenCount int64
-	if err := db.Model(&model.MessageMetaData{}).Where("user = ? AND read_flag = false", s.username).Count(&unseenCount).Error; err != nil {
+	if err := db.Model(&model.MessageMetaData{}).Where(
+		"user = ? AND JSON_CONTAINS(flags, ?) = 0",
+		s.username, fmt.Sprintf("%q", imap.FlagDeleted),
+	).Count(&unseenCount).Error; err != nil {
 		return nil, err
 	}
 
@@ -176,10 +186,10 @@ func (s *Session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	// 基本情報を構築
 	data := &imap.SelectData{
 		Flags: []imap.Flag{
-			"\\Seen", "\\Answered", "\\Flagged", "\\Deleted", "\\Draft",
+			imap.FlagSeen, imap.FlagDeleted, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDraft,
 		},
 		PermanentFlags: []imap.Flag{
-			"\\Seen", "\\Deleted", "\\*", // \\* は任意のユーザ定義フラグ許可
+			imap.FlagSeen, imap.FlagDeleted,
 		},
 		NumMessages: numMessages,
 		UIDNext:     uidNext,
@@ -228,7 +238,11 @@ func (s *Session) Status(mailbox string, options *imap.StatusOptions) (*imap.Sta
 
 	var msgs, unseen int64
 	db.Model(&model.MessageMetaData{}).Where("user = ?", s.username).Count(&msgs)
-	db.Model(&model.MessageMetaData{}).Where("user = ? AND read_flag = false", s.username).Count(&unseen)
+	db.Model(&model.MessageMetaData{}).Where(
+		"user = ? AND JSON_CONTAINS(flags, ?) = 0",
+		s.username,
+		fmt.Sprintf("%q", imap.FlagSeen),
+	).Count(&unseen)
 
 	var metaData model.MessageMetaData
 	if err := db.Where("user = ?", s.username).Last(&metaData).Error; err != nil {
@@ -269,47 +283,214 @@ func (s *Session) Close() error {
 
 func (s *Session) Unselect() error {
 	log.Println(pp.Sprintf("Unselect called"))
-	return errors.New("Unselect not implemented")
+	return nil
 }
 
 func (s *Session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
 	log.Println(pp.Sprintf("Expunge called with uids: %v", uids))
-	return errors.New("Expunge not implemented")
+	return nil
 }
 
 func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
 	log.Println(pp.Sprintf("Search called with kind: %v, criteria: %v, options: %v", kind, criteria, options))
 
-	// DBから削除フラグ付きメールのUID一覧を取得
-	var metaData []model.MessageMetaData
-	if err := db.Model(&model.MessageMetaData{}).Where("user = ? AND deleted_at IS NOT NULL", s.username).Find(&metaData).Error; err != nil {
-		return nil, err
+	if criteria != nil {
+		for _, flag := range criteria.Flag {
+			if flag == imap.FlagDeleted {
+				// 削除フラグ付きのメールを検索
+				// いったん空を返してみる
+				return nil, &imap.Error{
+					Code: imap.ResponseCodeNonExistent,
+				}
+			}
+			if flag == imap.FlagAnswered {
+				// 返信済みのメールを検索
+				// いったん空を返してみる
+				return nil, &imap.Error{
+					Code: imap.ResponseCodeNonExistent,
+				}
+			}
+			if flag == imap.FlagDraft {
+				// 下書きのメールを検索
+				// いったん空を返してみる
+				return nil, &imap.Error{
+					Code: imap.ResponseCodeNonExistent,
+				}
+			}
+		}
+
+		// 件数
+		var count int64
+		if err := db.Model(&model.MessageMetaData{}).Where("user = ?", s.username).Count(&count).Error; err != nil {
+			return nil, err
+		}
+		// 一番小さいIDと最大のIDを取得
+		var minID, maxID uint32
+		if count > 0 {
+			var metaData model.MessageMetaData
+			if err := db.Where("user = ?", s.username).Order("id ASC").First(&metaData).Error; err != nil {
+				return nil, err
+			}
+			minID = uint32(metaData.ID)
+			if err := db.Where("user = ?", s.username).Order("id DESC").First(&metaData).Error; err != nil {
+				return nil, err
+			}
+			maxID = uint32(metaData.ID)
+		} else {
+			minID = 0
+			maxID = 0
+		}
+
+		seqnum := imap.SeqSetNum(100)
+
+		return &imap.SearchData{
+			UID:   true,
+			All:   seqnum,
+			Min:   minID,
+			Max:   maxID,
+			Count: uint32(count),
+		}, nil
 	}
 
-	var min, max uint32
-	if len(metaData) > 0 {
-		min = uint32(metaData[0].ID)
-		max = uint32(metaData[len(metaData)-1].ID)
-	}
+	/*
+		// DBから削除フラグ付きメールのUID一覧を取得
+		var metaData []model.MessageMetaData
+		if err := db.Model(&model.MessageMetaData{}).Where("user = ? AND JSON_CONTAINS(flags, ?) = 0", s.username, `"\"\\Delete\""`).Find(&metaData).Error; err != nil {
+			return nil, err
+		}
 
-	all := make([]imap.UID, len(metaData))
-	for i, meta := range metaData {
-		all[i] = imap.UID(meta.ID)
-	}
+		var min, max uint32
+		if len(metaData) > 0 {
+			min = uint32(metaData[0].ID)
+			max = uint32(metaData[len(metaData)-1].ID)
+		}
 
-	return &imap.SearchData{
-		UID:   true,
-		All:   nil,
-		Min:   min,
-		Max:   max,
-		Count: uint32(len(metaData)),
-	}, nil
+		all := make([]imap.UID, len(metaData))
+		for i, meta := range metaData {
+			all[i] = imap.UID(meta.ID)
+		}
+
+		return &imap.SearchData{
+			UID:   false,
+			All:   nil,
+			Min:   min,
+			Max:   max,
+			Count: uint32(len(metaData)),
+		}, nil
+	*/
+	return nil, &imap.Error{}
 }
 
-func (s *Session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
-	log.Println(pp.Sprintf("Fetch called with numSet: %v, options: %v", numSet, options))
+func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.FetchOptions) error {
+	log.Println(pp.Sprintf("Fetch called with set: %v, opts: %v", set, opts))
+	uidSet, ok := set.(imap.UIDSet)
+	if !ok {
+		/*
+			return &imap.Error{
+				Type: imap.StatusResponseTypeBad,
+				Text: "FETCH only supports UIDSet",
+			}
+		*/
 
-	return errors.New("Fetch not implemented")
+		// 最新のメッセージを取得するために、UIDSetを仮に作成
+		var metaData model.MessageMetaData
+		if err := db.Where("user = ?", s.username).Last(&metaData).Error; err != nil {
+			return err
+		}
+		name, mbox, host := mailparser.ParseAddress(metaData.FromRaw)
+		from := []imap.Address{
+			{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			},
+		}
+		name, mbox, host = mailparser.ParseAddress(metaData.ToRaw)
+		to := []imap.Address{
+			{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			},
+		}
+		name, mbox, host = mailparser.ParseAddress(metaData.CcRaw)
+		cc := []imap.Address{
+			{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			},
+		}
+		name, mbox, host = mailparser.ParseAddress(metaData.BccRaw)
+		bcc := []imap.Address{
+			{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			},
+		}
+
+		msg := w.CreateMessage(uint32(metaData.ID))
+		msg.WriteEnvelope(&imap.Envelope{
+			Subject:   metaData.Subject,
+			From:      from,
+			To:        to,
+			Cc:        cc,
+			Bcc:       bcc,
+			MessageID: metaData.MessageID,
+			Date:      metaData.Timestamp,
+		})
+
+		if err := msg.Close(); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	var messages []model.MessageMetaData
+	if err := db.Where("user = ?", s.username).Find(&messages).Error; err != nil {
+		return err
+	}
+
+	for _, m := range messages {
+		uid := imap.UID(m.ID)
+		if !uidSet.Contains(uid) {
+			continue
+		}
+
+		seqNum := uint32(m.ID) // 仮：UID = SeqNum
+		msg := w.CreateMessage(seqNum)
+
+		// UIDの明示出力は不要。go-imapが内部で付加してくれる
+		var flags []imap.Flag
+		for _, flag := range m.Flags {
+			flags = append(flags, imap.Flag(flag))
+		}
+		msg.WriteFlags(flags)
+		msg.WriteEnvelope(&imap.Envelope{
+			Subject: m.Subject,
+			From: []imap.Address{
+				{
+					Mailbox: "test",
+					Host:    "mail.masa23.jp",
+					Name:    "test",
+				},
+			},
+			To: []imap.Address{
+				{Mailbox: "test",
+					Host: "mail.masa23.jp",
+					Name: "test"},
+			},
+			MessageID: m.MessageID,
+			Date:      m.Timestamp,
+		})
+
+		if err := msg.Close(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *Session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {

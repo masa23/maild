@@ -139,7 +139,7 @@ func addMailMetaData(r io.Reader, objKey string, size int64) error {
 		References:       msg.Header.Get("References"),
 		Timestamp:        timestamp,
 		HasAttachments:   hasAttachments,
-		Flags:            nil,
+		Flags:            []string{},
 		ObjectStorageKey: objKey,
 	}
 

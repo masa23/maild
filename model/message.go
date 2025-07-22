@@ -21,6 +21,6 @@ type MessageMetaData struct {
 	References       string    `gorm:"type:text" json:"references"`
 	Timestamp        time.Time `gorm:"not null" json:"timestamp"`
 	HasAttachments   bool      `gorm:"not null" json:"has_attachments"`
-	Flags            []string  `gorm:"type:json;serializer:json" json:"flags"`
+	Flags            []string  `gorm:"type:json;serializer:json;not null" json:"flags"`
 	ObjectStorageKey string    `gorm:"type:varchar(512);not null" json:"object_storage_key"`
 }
