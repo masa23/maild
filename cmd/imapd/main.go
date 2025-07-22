@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/masa23/maild/config"
 	"github.com/masa23/maild/mailparser"
 	"github.com/masa23/maild/model"
+	"github.com/masa23/maild/objectstorage"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
@@ -186,10 +188,10 @@ func (s *Session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	// 基本情報を構築
 	data := &imap.SelectData{
 		Flags: []imap.Flag{
-			imap.FlagSeen, imap.FlagDeleted, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDraft,
+			//imap.FlagSeen, imap.FlagDeleted, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDraft,
 		},
 		PermanentFlags: []imap.Flag{
-			imap.FlagSeen, imap.FlagDeleted,
+			//imap.FlagSeen, imap.FlagDeleted,
 		},
 		NumMessages: numMessages,
 		UIDNext:     uidNext,
@@ -440,6 +442,26 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 			MessageID: metaData.MessageID,
 			Date:      metaData.Timestamp,
 		})
+		msg.WriteUID(imap.UID(metaData.ID))
+		msg.WriteRFC822Size(metaData.Size)
+		wr := msg.WriteBodySection(
+			&imap.FetchItemBodySection{
+				Specifier: imap.PartSpecifierText,
+			},
+			metaData.Size,
+		)
+
+		body, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey)
+		if err != nil {
+			return err
+		}
+		defer body.Close()
+		if _, err := io.Copy(wr, body); err != nil {
+			return err
+		}
+		if err := wr.Close(); err != nil {
+			return err
+		}
 
 		if err := msg.Close(); err != nil {
 			return err
@@ -467,23 +489,67 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 			flags = append(flags, imap.Flag(flag))
 		}
 		msg.WriteFlags(flags)
+
+		name, mbox, host := mailparser.ParseAddress(m.FromRaw)
+		from := []imap.Address{
+			{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			},
+		}
+		name, mbox, host = mailparser.ParseAddress(m.ToRaw)
+		to := []imap.Address{
+			{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			},
+		}
+		name, mbox, host = mailparser.ParseAddress(m.CcRaw)
+		cc := []imap.Address{
+			{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			},
+		}
+		name, mbox, host = mailparser.ParseAddress(m.BccRaw)
+		bcc := []imap.Address{
+			{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			},
+		}
+
 		msg.WriteEnvelope(&imap.Envelope{
-			Subject: m.Subject,
-			From: []imap.Address{
-				{
-					Mailbox: "test",
-					Host:    "mail.masa23.jp",
-					Name:    "test",
-				},
-			},
-			To: []imap.Address{
-				{Mailbox: "test",
-					Host: "mail.masa23.jp",
-					Name: "test"},
-			},
+			Subject:   m.Subject,
+			From:      from,
+			To:        to,
+			Cc:        cc,
+			Bcc:       bcc,
 			MessageID: m.MessageID,
 			Date:      m.Timestamp,
 		})
+		body, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, m.ObjectStorageKey)
+		if err != nil {
+			return err
+		}
+		defer body.Close()
+
+		msg.WriteRFC822Size(m.Size)
+
+		wr := msg.WriteBodySection(
+			&imap.FetchItemBodySection{
+				Specifier: imap.PartSpecifierText,
+			},
+			m.Size,
+		)
+		if _, err := io.Copy(wr, body); err != nil {
+			return err
+		}
+		wr.Close()
 
 		if err := msg.Close(); err != nil {
 			return err
