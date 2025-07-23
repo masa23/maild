@@ -1,15 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/mail"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -301,6 +300,7 @@ func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	if criteria != nil {
 		for _, flag := range criteria.Flag {
 			if flag == imap.FlagDeleted {
+
 				// 削除フラグ付きのメールを検索
 				// いったん空を返してみる
 				return &imap.SearchData{
@@ -440,6 +440,7 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 				})
 			}
 		}
+
 		// seqnumは1:100の場合は、行頭から100件、200:300の場合は、201から300件を取得する
 		// stringからstartとendを取得
 		for _, meta := range messages {
@@ -488,34 +489,28 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 				MessageID: metaData.MessageID,
 				Date:      metaData.Timestamp,
 			})
-			body, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey)
-			if err != nil {
-				return err
-			}
-			// ヘッダーだけ取り出し
-			mm, err := mail.ReadMessage(body)
-			if err != nil {
-				return err
-			}
-			body.Close()
 
 			msg.WriteUID(imap.UID(metaData.ID))
 			msg.WriteRFC822Size(metaData.Size)
+
+			// ヘッダをデータ作成
+			var hb bytes.Buffer
+			for k, v := range metaData.Headers {
+				if _, err := hb.WriteString(fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, ", "))); err != nil {
+					return err
+				}
+			}
+			hb.WriteString("\r\n")
+
 			wr := msg.WriteBodySection(
 				&imap.FetchItemBodySection{
 					Specifier: imap.PartSpecifierHeader,
 					//HeaderFields: hf,
 				},
-				metaData.Size,
+				int64(hb.Len()),
 			)
 
-			// ヘッダを書き込む
-			for k, v := range mm.Header {
-				if _, err := wr.Write([]byte(fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, ", ")))); err != nil {
-					return err
-				}
-			}
-			if _, err := wr.Write([]byte("\r\n")); err != nil {
+			if _, err := wr.Write(hb.Bytes()); err != nil {
 				return err
 			}
 
@@ -528,18 +523,36 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 		return nil
 	}
 
-	var messages []model.MessageMetaData
-	if err := db.Where("user = ?", s.username).Find(&messages).Error; err != nil {
-		return err
+	// UIDSetの場合の処理
+	if len(uidSet) == 0 {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "FETCH requires non-empty UIDSet",
+		}
 	}
 
-	for _, m := range messages {
+	var messages []model.MessageMetaData
+	for _, uid := range uidSet {
+		var metaData []model.MessageMetaData
+		log.Println(pp.Sprintf("Fetching message with UID: %d", uid))
+		// uid.Startとuid.Stopで範囲を取得
+		if err := db.Where("user = ? AND (id >= ? AND id <= ?)", s.username, uid.Start, uid.Stop).
+			Find(&metaData).Error; err != nil {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: fmt.Sprintf("Message with UID %d not found", uid),
+			}
+		}
+		messages = append(messages, metaData...)
+	}
+
+	for i, m := range messages {
 		uid := imap.UID(m.ID)
 		if !uidSet.Contains(uid) {
 			continue
 		}
 
-		seqNum := uint32(m.ID) // 仮：UID = SeqNum
+		seqNum := uint32(i) // 仮：UID = SeqNum
 		msg := w.CreateMessage(seqNum)
 
 		// UIDの明示出力は不要。go-imapが内部で付加してくれる
@@ -598,6 +611,7 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 		defer body.Close()
 
 		msg.WriteRFC822Size(m.Size)
+		msg.WriteUID(uid)
 
 		wr := msg.WriteBodySection(
 			&imap.FetchItemBodySection{
@@ -610,8 +624,6 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 		}
 		wr.Close()
 
-		time.Sleep(1 * time.Second)
-
 		if err := msg.Close(); err != nil {
 			return err
 		}
@@ -622,7 +634,73 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 
 func (s *Session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
 	log.Println(pp.Sprintf("Store called with numSet: %v, flags: %v, options: %v", numSet, flags, options))
-	return errors.New("Store not implemented")
+	if flags == nil || len(flags.Flags) == 0 {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "STORE requires flags",
+		}
+	}
+	numSetUID, ok := numSet.(imap.UIDSet)
+	if !ok {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "STORE only supports UIDSet",
+		}
+	}
+	for _, uid := range numSetUID {
+		var metaData model.MessageMetaData
+		if err := db.Where("user = ? AND id = ?", s.username, uid).
+			First(&metaData).Error; err != nil {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: fmt.Sprintf("Message with UID %d not found", uid),
+			}
+		}
+		// フラグを更新
+		switch flags.Op {
+		case imap.StoreFlagsSet:
+			metaData.Flags = []string{}
+			for _, flag := range flags.Flags {
+				metaData.Flags = append(metaData.Flags, string(flag))
+			}
+		case imap.StoreFlagsAdd:
+			for _, flag := range flags.Flags {
+				if !flagsContains(metaData.Flags, string(flag)) {
+					metaData.Flags = append(metaData.Flags, string(flag))
+				}
+			}
+		case imap.StoreFlagsDel:
+			for _, flag := range flags.Flags {
+				metaData.Flags = flagsRemove(metaData.Flags, string(flag))
+			}
+		}
+		if err := db.Save(&metaData).Error; err != nil {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: fmt.Sprintf("Failed to update flags for UID %d: %v", uid, err),
+			}
+		}
+	}
+
+	return nil
+}
+
+func flagsContains(flags []string, flag string) bool {
+	for _, f := range flags {
+		if f == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func flagsRemove(slice []string, item string) []string {
+	for i, v := range slice {
+		if v == item {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
 }
 
 func (s *Session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) {

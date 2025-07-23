@@ -140,6 +140,7 @@ func addMailMetaData(r io.Reader, objKey string, size int64) error {
 		Timestamp:        timestamp,
 		HasAttachments:   hasAttachments,
 		Flags:            []string{},
+		Headers:          msg.Header,
 		ObjectStorageKey: objKey,
 	}
 
