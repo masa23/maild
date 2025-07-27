@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/mail"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -479,7 +480,8 @@ func fetch(metaData model.MessageMetaData, seqNum uint32, w *imapserver.FetchWri
 	// ヘッダをデータ作成
 	if opts != nil && opts.BodySection != nil {
 		for _, section := range opts.BodySection {
-			if section.Specifier == imap.PartSpecifierHeader {
+			switch section.Specifier {
+			case imap.PartSpecifierHeader:
 				var hb bytes.Buffer
 				for k, v := range metaData.Headers {
 					if _, err := hb.WriteString(fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, ", "))); err != nil {
@@ -499,8 +501,7 @@ func fetch(metaData model.MessageMetaData, seqNum uint32, w *imapserver.FetchWri
 					return err
 				}
 				wr.Close()
-			}
-			if section.Specifier == imap.PartSpecifierNone {
+			case imap.PartSpecifierNone, imap.PartSpecifierText:
 				// オブジェクトストレージからメッセージをダウンロード
 				obj, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey)
 				if err != nil {
@@ -508,18 +509,37 @@ func fetch(metaData model.MessageMetaData, seqNum uint32, w *imapserver.FetchWri
 				}
 				defer obj.Close()
 
-				// メッセージのボディを読み込む
-				body, err := io.ReadAll(obj)
-				if err != nil {
-					return fmt.Errorf("error reading message body: %v", err)
-				}
+				if section.Specifier == imap.PartSpecifierText {
+					// Body部分だけ返す
+					m, err := mail.ReadMessage(obj)
+					if err != nil {
+						return fmt.Errorf("error reading message: %v", err)
+					}
+					body, err := io.ReadAll(m.Body)
+					if err != nil {
+						return fmt.Errorf("error reading message body: %v", err)
+					}
+					wr := msg.WriteBodySection(section, int64(len(body)))
+					log.Println(pp.Sprintf("Writing body of size: %d", len(body)))
+					if _, err := wr.Write(body); err != nil {
+						return fmt.Errorf("error writing message body: %v", err)
+					}
 
-				wr := msg.WriteBodySection(section, int64(len(body)))
-				log.Println(pp.Sprintf("Writing body of size: %d", len(body)))
-				if _, err := wr.Write(body); err != nil {
-					return fmt.Errorf("error writing message body: %v", err)
+				} else {
+					// メッセージをすべて返す
+					body, err := io.ReadAll(obj)
+					if err != nil {
+						return fmt.Errorf("error reading message body: %v", err)
+					}
+					wr := msg.WriteBodySection(section, int64(len(body)))
+					log.Println(pp.Sprintf("Writing body of size: %d", len(body)))
+					if _, err := wr.Write(body); err != nil {
+						return fmt.Errorf("error writing message body: %v", err)
+					}
+					wr.Close()
 				}
-				wr.Close()
+			case imap.PartSpecifierMIME:
+				// MIMEだけ返すらしい
 			}
 		}
 	}
@@ -536,12 +556,7 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 	log.Println(pp.Sprintf("fetch uid or seq: %v %b", uidSet, ok))
 
 	if !ok {
-		/*
-			return &imap.Error{
-				Type: imap.StatusResponseTypeBad,
-				Text: "FETCH only supports UIDSet",
-			}
-		*/
+		// UIDではない場合、SeqSetとして処理
 		seq := set.(imap.SeqSet)
 		messages := []struct {
 			model  model.MessageMetaData
@@ -582,50 +597,49 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 		}
 
 		return nil
-	}
-
-	// UIDSetの場合の処理
-	if len(uidSet) == 0 {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeBad,
-			Text: "FETCH requires non-empty UIDSet",
-		}
-	}
-
-	var messages []model.MessageMetaData
-	for _, uid := range uidSet {
-		var metaData []model.MessageMetaData
-		log.Println(pp.Sprintf("Fetching message with UID: %d", uid))
-		// uid.Startとuid.Stopで範囲を取得
-		if err := db.Where("user = ? AND (id >= ? AND id <= ?)", s.username, uid.Start, uid.Stop).
-			Find(&metaData).Error; err != nil {
+	} else {
+		// UIDSetの場合の処理
+		if len(uidSet) == 0 {
 			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Text: fmt.Sprintf("Message with UID %d not found", uid),
+				Type: imap.StatusResponseTypeBad,
+				Text: "FETCH requires non-empty UIDSet",
 			}
 		}
-		messages = append(messages, metaData...)
-	}
 
-	// messagesが1件の場合は、fetchを呼び出す
-	if len(messages) == 1 {
-		if err := fetch(messages[0], 1, w, opts); err != nil {
-			return err
+		var messages []model.MessageMetaData
+		for _, uid := range uidSet {
+			var metaData []model.MessageMetaData
+			log.Println(pp.Sprintf("Fetching message with UID: %d", uid))
+			// uid.Startとuid.Stopで範囲を取得
+			if err := db.Where("user = ? AND (id >= ? AND id <= ?)", s.username, uid.Start, uid.Stop).
+				Find(&metaData).Error; err != nil {
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: fmt.Sprintf("Message with UID %d not found", uid),
+				}
+			}
+			messages = append(messages, metaData...)
+		}
+
+		// messagesが1件の場合は、fetchを呼び出す
+		if len(messages) == 1 {
+			if err := fetch(messages[0], 1, w, opts); err != nil {
+				return err
+			}
+		}
+
+		// 複数件の場合は、ループで処理
+		for i, m := range messages {
+			uid := imap.UID(m.ID)
+			if !uidSet.Contains(uid) {
+				continue
+			}
+
+			if err := fetch(m, uint32(i+1), w, opts); err != nil {
+				return err
+			}
 		}
 	}
-
-	// 複数件の場合は、ループで処理
-	for i, m := range messages {
-		uid := imap.UID(m.ID)
-		if !uidSet.Contains(uid) {
-			continue
-		}
-
-		if err := fetch(m, uint32(i+1), w, opts); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
