@@ -297,6 +297,13 @@ func (s *Session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
 	log.Println(pp.Sprintf("Search called with kind: %v, criteria: %v, options: %v", kind, criteria, options))
 
+	if kind != imapserver.NumKindUID {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "Search only supports UID kind",
+		}
+	}
+
 	if criteria != nil {
 		for _, flag := range criteria.Flag {
 			if flag == imap.FlagDeleted {
@@ -402,9 +409,132 @@ func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	return nil, &imap.Error{}
 }
 
+// Envelopeを返す関数
+func buildEnvelope(m *model.MessageMetaData) *imap.Envelope {
+	name, mbox, host := mailparser.ParseAddress(m.FromRaw)
+	from := []imap.Address{
+		{
+			Mailbox: mbox,
+			Host:    host,
+			Name:    name,
+		},
+	}
+	name, mbox, host = mailparser.ParseAddress(m.ToRaw)
+	to := []imap.Address{
+		{
+			Mailbox: mbox,
+			Host:    host,
+			Name:    name,
+		},
+	}
+	name, mbox, host = mailparser.ParseAddress(m.CcRaw)
+	cc := []imap.Address{
+		{
+			Mailbox: mbox,
+			Host:    host,
+			Name:    name,
+		},
+	}
+	name, mbox, host = mailparser.ParseAddress(m.BccRaw)
+	bcc := []imap.Address{
+		{
+			Mailbox: mbox,
+			Host:    host,
+			Name:    name,
+		},
+	}
+
+	return &imap.Envelope{
+		Subject:   m.Subject,
+		From:      from,
+		To:        to,
+		Cc:        cc,
+		Bcc:       bcc,
+		MessageID: m.MessageID,
+		Date:      m.Timestamp,
+	}
+}
+
+func fetch(metaData model.MessageMetaData, seqNum uint32, w *imapserver.FetchWriter, opts *imap.FetchOptions) error {
+	msg := w.CreateMessage(seqNum)
+
+	if opts != nil && opts.Envelope {
+		msg.WriteEnvelope(buildEnvelope(&metaData))
+	}
+
+	if opts != nil && opts.UID {
+		msg.WriteUID(imap.UID(metaData.ID))
+	}
+	if opts != nil && opts.RFC822Size {
+		msg.WriteRFC822Size(metaData.Size)
+	}
+	if opts != nil && opts.Flags {
+		var flags []imap.Flag
+		for _, flag := range metaData.Flags {
+			flags = append(flags, imap.Flag(flag))
+		}
+		msg.WriteFlags(flags)
+	}
+
+	// ヘッダをデータ作成
+	if opts != nil && opts.BodySection != nil {
+		for _, section := range opts.BodySection {
+			if section.Specifier == imap.PartSpecifierHeader {
+				var hb bytes.Buffer
+				for k, v := range metaData.Headers {
+					if _, err := hb.WriteString(fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, ", "))); err != nil {
+						return err
+					}
+				}
+				hb.WriteString("\r\n")
+
+				wr := msg.WriteBodySection(
+					&imap.FetchItemBodySection{
+						Specifier: imap.PartSpecifierHeader,
+					},
+					int64(hb.Len()),
+				)
+				log.Println(pp.Sprintf("Writing header of size: %d", hb.Len()))
+				if _, err := wr.Write(hb.Bytes()); err != nil {
+					return err
+				}
+				wr.Close()
+			}
+			if section.Specifier == imap.PartSpecifierNone {
+				// オブジェクトストレージからメッセージをダウンロード
+				obj, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey)
+				if err != nil {
+					return fmt.Errorf("error downloading object: %v", err)
+				}
+				defer obj.Close()
+
+				// メッセージのボディを読み込む
+				body, err := io.ReadAll(obj)
+				if err != nil {
+					return fmt.Errorf("error reading message body: %v", err)
+				}
+
+				wr := msg.WriteBodySection(section, int64(len(body)))
+				log.Println(pp.Sprintf("Writing body of size: %d", len(body)))
+				if _, err := wr.Write(body); err != nil {
+					return fmt.Errorf("error writing message body: %v", err)
+				}
+				wr.Close()
+			}
+		}
+	}
+
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.FetchOptions) error {
 	log.Println(pp.Sprintf("Fetch called with set: %v, opts: %v", set, opts))
 	uidSet, ok := set.(imap.UIDSet)
+	log.Println(pp.Sprintf("fetch uid or seq: %v %b", uidSet, ok))
+
 	if !ok {
 		/*
 			return &imap.Error{
@@ -445,79 +575,10 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 		// stringからstartとendを取得
 		for _, meta := range messages {
 			metaData := meta.model
+			if err := fetch(metaData, meta.number, w, opts); err != nil {
+				return err
+			}
 			log.Println(pp.Sprintf("Processing message ID: %d", metaData.ID))
-			name, mbox, host := mailparser.ParseAddress(metaData.FromRaw)
-			from := []imap.Address{
-				{
-					Mailbox: mbox,
-					Host:    host,
-					Name:    name,
-				},
-			}
-			name, mbox, host = mailparser.ParseAddress(metaData.ToRaw)
-			to := []imap.Address{
-				{
-					Mailbox: mbox,
-					Host:    host,
-					Name:    name,
-				},
-			}
-			name, mbox, host = mailparser.ParseAddress(metaData.CcRaw)
-			cc := []imap.Address{
-				{
-					Mailbox: mbox,
-					Host:    host,
-					Name:    name,
-				},
-			}
-			name, mbox, host = mailparser.ParseAddress(metaData.BccRaw)
-			bcc := []imap.Address{
-				{
-					Mailbox: mbox,
-					Host:    host,
-					Name:    name,
-				},
-			}
-
-			msg := w.CreateMessage(meta.number)
-			msg.WriteEnvelope(&imap.Envelope{
-				Subject:   metaData.Subject,
-				From:      from,
-				To:        to,
-				Cc:        cc,
-				Bcc:       bcc,
-				MessageID: metaData.MessageID,
-				Date:      metaData.Timestamp,
-			})
-
-			msg.WriteUID(imap.UID(metaData.ID))
-			msg.WriteRFC822Size(metaData.Size)
-
-			// ヘッダをデータ作成
-			var hb bytes.Buffer
-			for k, v := range metaData.Headers {
-				if _, err := hb.WriteString(fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, ", "))); err != nil {
-					return err
-				}
-			}
-			hb.WriteString("\r\n")
-
-			wr := msg.WriteBodySection(
-				&imap.FetchItemBodySection{
-					Specifier: imap.PartSpecifierHeader,
-					//HeaderFields: hf,
-				},
-				int64(hb.Len()),
-			)
-
-			if _, err := wr.Write(hb.Bytes()); err != nil {
-				return err
-			}
-
-			wr.Close()
-			if err := msg.Close(); err != nil {
-				return err
-			}
 		}
 
 		return nil
@@ -546,85 +607,21 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 		messages = append(messages, metaData...)
 	}
 
+	// messagesが1件の場合は、fetchを呼び出す
+	if len(messages) == 1 {
+		if err := fetch(messages[0], 1, w, opts); err != nil {
+			return err
+		}
+	}
+
+	// 複数件の場合は、ループで処理
 	for i, m := range messages {
 		uid := imap.UID(m.ID)
 		if !uidSet.Contains(uid) {
 			continue
 		}
 
-		seqNum := uint32(i) // 仮：UID = SeqNum
-		msg := w.CreateMessage(seqNum)
-
-		// UIDの明示出力は不要。go-imapが内部で付加してくれる
-		var flags []imap.Flag
-		for _, flag := range m.Flags {
-			flags = append(flags, imap.Flag(flag))
-		}
-		msg.WriteFlags(flags)
-
-		name, mbox, host := mailparser.ParseAddress(m.FromRaw)
-		from := []imap.Address{
-			{
-				Mailbox: mbox,
-				Host:    host,
-				Name:    name,
-			},
-		}
-		name, mbox, host = mailparser.ParseAddress(m.ToRaw)
-		to := []imap.Address{
-			{
-				Mailbox: mbox,
-				Host:    host,
-				Name:    name,
-			},
-		}
-		name, mbox, host = mailparser.ParseAddress(m.CcRaw)
-		cc := []imap.Address{
-			{
-				Mailbox: mbox,
-				Host:    host,
-				Name:    name,
-			},
-		}
-		name, mbox, host = mailparser.ParseAddress(m.BccRaw)
-		bcc := []imap.Address{
-			{
-				Mailbox: mbox,
-				Host:    host,
-				Name:    name,
-			},
-		}
-
-		msg.WriteEnvelope(&imap.Envelope{
-			Subject:   m.Subject,
-			From:      from,
-			To:        to,
-			Cc:        cc,
-			Bcc:       bcc,
-			MessageID: m.MessageID,
-			Date:      m.Timestamp,
-		})
-		body, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, m.ObjectStorageKey)
-		if err != nil {
-			return err
-		}
-		defer body.Close()
-
-		msg.WriteRFC822Size(m.Size)
-		msg.WriteUID(uid)
-
-		wr := msg.WriteBodySection(
-			&imap.FetchItemBodySection{
-				Specifier: imap.PartSpecifierText,
-			},
-			m.Size,
-		)
-		if _, err := io.Copy(wr, body); err != nil {
-			return err
-		}
-		wr.Close()
-
-		if err := msg.Close(); err != nil {
+		if err := fetch(m, uint32(i+1), w, opts); err != nil {
 			return err
 		}
 	}
@@ -647,38 +644,43 @@ func (s *Session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 			Text: "STORE only supports UIDSet",
 		}
 	}
+
 	for _, uid := range numSetUID {
-		var metaData model.MessageMetaData
-		if err := db.Where("user = ? AND id = ?", s.username, uid).
-			First(&metaData).Error; err != nil {
+		var data []model.MessageMetaData
+		// rangeで指定
+		if err := db.Where("user = ? AND (id >= ? AND id <= ?)", s.username, uid.Start, uid.Stop).
+			Find(&data).Error; err != nil {
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Text: fmt.Sprintf("Message with UID %d not found", uid),
 			}
 		}
-		// フラグを更新
-		switch flags.Op {
-		case imap.StoreFlagsSet:
-			metaData.Flags = []string{}
-			for _, flag := range flags.Flags {
-				metaData.Flags = append(metaData.Flags, string(flag))
-			}
-		case imap.StoreFlagsAdd:
-			for _, flag := range flags.Flags {
-				if !flagsContains(metaData.Flags, string(flag)) {
+		for _, metaData := range data {
+			// フラグを更新
+			switch flags.Op {
+			case imap.StoreFlagsSet:
+				metaData.Flags = []string{}
+				for _, flag := range flags.Flags {
 					metaData.Flags = append(metaData.Flags, string(flag))
 				}
+			case imap.StoreFlagsAdd:
+				for _, flag := range flags.Flags {
+					if !flagsContains(metaData.Flags, string(flag)) {
+						metaData.Flags = append(metaData.Flags, string(flag))
+					}
+				}
+			case imap.StoreFlagsDel:
+				for _, flag := range flags.Flags {
+					metaData.Flags = flagsRemove(metaData.Flags, string(flag))
+				}
 			}
-		case imap.StoreFlagsDel:
-			for _, flag := range flags.Flags {
-				metaData.Flags = flagsRemove(metaData.Flags, string(flag))
+			if err := db.Save(&metaData).Error; err != nil {
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: fmt.Sprintf("Failed to update flags for UID %d: %v", uid, err),
+				}
 			}
-		}
-		if err := db.Save(&metaData).Error; err != nil {
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Text: fmt.Sprintf("Failed to update flags for UID %d: %v", uid, err),
-			}
+			log.Println(pp.Sprintf("Updated flags for UID %d: %v", uid, metaData.Flags))
 		}
 	}
 
