@@ -20,6 +20,7 @@ import (
 	"github.com/masa23/maild/mailparser"
 	"github.com/masa23/maild/model"
 	"github.com/masa23/maild/objectstorage"
+	"github.com/masa23/maild/savemail"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
@@ -84,6 +85,7 @@ func main() {
 			//imap.CapIMAP4rev2: {},
 		},
 		InsecureAuth: true,
+		DebugWriter:  log.Writer(),
 	})
 	ln, err := net.Listen("tcp", "0.0.0.0:143")
 	if err != nil {
@@ -95,7 +97,9 @@ func main() {
 }
 
 type Session struct {
-	username string
+	username  string
+	mailbox   string
+	mailboxID uint64
 }
 
 func (s *Session) SupportsIMAP4rev2() bool {
@@ -116,6 +120,14 @@ func (s *Session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 
 func (s *Session) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
 	log.Println(pp.Sprintf("List called with ref: %s, patterns: %v, options: %v", ref, patterns, options))
+
+	// メールボックスを取得
+	var mailboxes []model.Mailbox
+	if err := db.Where("user = ?", s.username).Find(&mailboxes).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	// メールボックスのリストを返す
 	list := imap.ListData{
 		Attrs:   []imap.MailboxAttr{imap.MailboxAttrHasNoChildren},
 		Delim:   '/',
@@ -125,29 +137,14 @@ func (s *Session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 	if err := w.WriteList(&list); err != nil {
 		return err
 	}
-
-	if err := w.WriteList(&imap.ListData{
-		Attrs:   []imap.MailboxAttr{imap.MailboxAttrHasNoChildren},
-		Delim:   '/',
-		Mailbox: "Drafts",
-	}); err != nil {
-		return err
-	}
-
-	if err := w.WriteList(&imap.ListData{
-		Attrs:   []imap.MailboxAttr{imap.MailboxAttrHasNoChildren},
-		Delim:   '/',
-		Mailbox: "Sent",
-	}); err != nil {
-		return err
-	}
-
-	if err := w.WriteList(&imap.ListData{
-		Attrs:   []imap.MailboxAttr{imap.MailboxAttrHasNoChildren},
-		Delim:   '/',
-		Mailbox: "Trash",
-	}); err != nil {
-		return err
+	for _, mailbox := range mailboxes {
+		if err := w.WriteList(&imap.ListData{
+			Attrs:   []imap.MailboxAttr{imap.MailboxAttrHasNoChildren},
+			Delim:   '/',
+			Mailbox: mailbox.Name,
+		}); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -155,28 +152,53 @@ func (s *Session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 
 func (s *Session) Select(mailbox string, options *imap.SelectOptions) (*imap.SelectData, error) {
 	log.Println(pp.Printf("Select called with mailbox: %s, options: %v", mailbox, options))
+	// メールボックスの選択処理
+	var mailboxID uint64
 
-	if strings.ToUpper(mailbox) != "INBOX" {
-		return nil, &imap.Error{
-			Code: imap.ResponseCodeNonExistent,
+	// 現時点では INBOX のみをサポート
+	if strings.ToUpper(mailbox) == "INBOX" {
+		// INBOXの場合のみMailBoxIDを0に設定
+		mailboxID = 0
+	} else {
+		// 他のメールボックスの場合はIDを取得
+		var mbox model.Mailbox
+		if err := db.Where("name = ? AND user = ?", mailbox, s.username).First(&mbox).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: "Mailbox does not exist",
+				}
+			}
+			return nil, fmt.Errorf("error finding mailbox: %v", err)
 		}
+		mailboxID = mbox.ID
 	}
 
 	// メールボックスのメタデータを取得
 	var metaData model.MessageMetaData
-	if err := db.Where("user = ?", s.username).Last(&metaData).Error; err != nil {
+	if err := db.Where(
+		"user = ? AND mailbox_id = ?",
+		s.username,
+		mailboxID,
+	).Last(&metaData).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
 	// メールボックスのメッセージ数をカウント
 	var count int64
-	if err := db.Model(&model.MessageMetaData{}).Where("user = ?", s.username).Count(&count).Error; err != nil {
+	if err := db.Model(&model.MessageMetaData{}).Where(
+		"user = ? AND mailbox_id = ?",
+		s.username,
+		mailboxID,
+	).Count(&count).Error; err != nil {
 		return nil, err
 	}
 	// メールボックスの未読メッセージ数をカウント
 	var unseenCount int64
 	if err := db.Model(&model.MessageMetaData{}).Where(
-		"user = ? AND JSON_CONTAINS(flags, ?) = 0",
-		s.username, fmt.Sprintf("%q", imap.FlagDeleted),
+		"user = ? AND mailbox_id = ? AND JSON_CONTAINS(flags, ?) = 0",
+		s.username,
+		mailboxID,
+		fmt.Sprintf("%q", imap.FlagDeleted),
 	).Count(&unseenCount).Error; err != nil {
 		return nil, err
 	}
@@ -204,22 +226,124 @@ func (s *Session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 		data.HighestModSeq = highestModSeq
 	}
 
+	// メールボックスの情報を設定
+	s.mailbox = mailbox
+	s.mailboxID = mailboxID
+
 	return data, nil
 }
 
 func (s *Session) Create(mailbox string, options *imap.CreateOptions) error {
 	log.Println(pp.Sprintf("Create called with mailbox: %s, options: %v", mailbox, options))
+	if mailbox == "" {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "Mailbox name cannot be empty",
+		}
+	}
+
+	// メールボックスを作成
+	newMailbox := model.Mailbox{
+		Name: mailbox,
+		User: s.username,
+	}
+
+	if err := db.Create(&newMailbox).Error; err != nil {
+		return fmt.Errorf("error creating mailbox: %v", err)
+	}
+	log.Printf("Mailbox created: %s", mailbox)
+
 	return nil
 }
 
 func (s *Session) Delete(mailbox string) error {
 	log.Println(pp.Sprintf("Delete called with mailbox: %s", mailbox))
-	return errors.New("Delete not implemented")
+	if mailbox == "" {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "Mailbox name cannot be empty",
+		}
+	}
+
+	// メールボックスを削除
+	var mailboxData model.Mailbox
+	if err := db.Where("name = ? AND user = ?", mailbox, s.username).First(&mailboxData).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: "Mailbox does not exist",
+			}
+		}
+		return fmt.Errorf("error finding mailbox: %v", err)
+	}
+	if err := db.Delete(&mailboxData).Error; err != nil {
+		return fmt.Errorf("error deleting mailbox: %v", err)
+	}
+
+	//ToDo: メールボックスに紐づくメッセージの削除処理
+
+	log.Printf("Mailbox deleted: %s", mailbox)
+
+	return nil
 }
 
 func (s *Session) Rename(mailbox, newName string) error {
 	log.Println(pp.Sprintf("Rename called with mailbox: %s, newName: %s", mailbox, newName))
-	return errors.New("Rename not implemented")
+	if mailbox == "" || newName == "" {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "Mailbox name and new name cannot be empty",
+		}
+	}
+
+	// メールボックスを取得
+	// トランザクションを行い、同一のメールボックス名が存在しないことを確認
+	var mailboxData model.Mailbox
+	tx := db.Begin()
+
+	// 既存のメールボックスを取得
+	if err := tx.Where("name = ? AND user = ?", mailbox, s.username).First(&mailboxData).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			tx.Rollback()
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: "Mailbox does not exist",
+			}
+		}
+		tx.Rollback()
+		return fmt.Errorf("error finding mailbox: %v", err)
+	}
+
+	// 新しいメールボックス名が既に存在するか確認
+	var existingMailbox model.Mailbox
+	if err := tx.Where("name = ? AND user = ?", newName, s.username).First(&existingMailbox).Error; err == nil {
+		tx.Rollback()
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Mailbox with new name already exists",
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		tx.Rollback()
+		return fmt.Errorf("error checking existing mailbox: %v", err)
+	}
+
+	// メールボックス名を更新
+	mailboxData.Name = newName
+	if err := tx.Save(&mailboxData).Error; err != nil {
+		tx.Rollback()
+		return fmt.Errorf("error renaming mailbox: %v", err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return fmt.Errorf("error committing transaction: %v", err)
+	}
+	log.Printf("Mailbox renamed from %s to %s", mailbox, newName)
+
+	// 参照を更新
+	s.mailbox = newName
+	s.mailboxID = mailboxData.ID
+
+	return nil
 }
 
 func (s *Session) Subscribe(mailbox string) error {
@@ -234,23 +358,46 @@ func (s *Session) Unsubscribe(mailbox string) error {
 
 func (s *Session) Status(mailbox string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	log.Println(pp.Sprintf("Status called with mailbox: %s, options: %v", mailbox, options))
+	mailboxID := uint64(0) // INBOXのIDは0とする
 	if strings.ToUpper(mailbox) != "INBOX" {
-		return nil, &imap.Error{
-			Code: imap.ResponseCodeNonExistent,
+		// 他のメールボックスの場合はIDを取得
+		var mbox model.Mailbox
+		if err := db.Where("name = ? AND user = ?", mailbox, s.username).First(&mbox).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: "Mailbox does not exist",
+				}
+			}
+			return nil, fmt.Errorf("error finding mailbox: %v", err)
 		}
+		mailboxID = mbox.ID
 	}
 
 	var msgs, unseen int64
-	db.Model(&model.MessageMetaData{}).Where("user = ?", s.username).Count(&msgs)
+	// メッセージ数をカウント
 	db.Model(&model.MessageMetaData{}).Where(
-		"user = ? AND JSON_CONTAINS(flags, ?) = 0",
+		"user = ? AND mailbox_id = ?",
 		s.username,
+		mailboxID,
+	).Count(&msgs)
+	// 未読メッセージ数をカウント
+	db.Model(&model.MessageMetaData{}).Where(
+		"user = ? AND mailbox_id = ? AND JSON_CONTAINS(flags, ?) = 0",
+		s.username,
+		mailboxID,
 		fmt.Sprintf("%q", imap.FlagSeen),
 	).Count(&unseen)
 
+	// ToDo: UIDNextの扱いが正しくない。
+	// MySQLの場合はID=UIDでも問題ないが、TiDBの場合は必ずインクリメントされるわけではない。
 	var metaData model.MessageMetaData
-	if err := db.Where("user = ?", s.username).Last(&metaData).Error; err != nil {
-		return nil, err
+	if err := db.Where(
+		"user = ? AND mailbox_id = ?",
+		s.username,
+		mailboxID,
+	).Last(&metaData).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("error finding last message metadata: %v", err)
 	}
 
 	numMessages := uint32(msgs)
@@ -267,7 +414,62 @@ func (s *Session) Status(mailbox string, options *imap.StatusOptions) (*imap.Sta
 
 func (s *Session) Append(mailbox string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
 	log.Println(pp.Sprintf("Append called with mailbox: %s, options: %v", mailbox, options))
-	return nil, errors.New("Append not implemented")
+
+	if mailbox == "" {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "Mailbox name cannot be empty",
+		}
+	}
+
+	if mailbox == "INBOX" {
+		s.mailboxID = 0 // INBOXのIDは0とする
+		s.mailbox = "INBOX"
+	} else {
+		// メールボックスを取得
+		var mailboxData model.Mailbox
+		if err := db.Where("name = ? AND user = ?", mailbox, s.username).First(&mailboxData).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: "Mailbox does not exist",
+				}
+			}
+			return nil, fmt.Errorf("error finding mailbox: %v", err)
+		}
+		s.mailboxID = mailboxData.ID
+		s.mailbox = mailbox
+	}
+
+	// DBとオブジェクトストレージに保存
+	buf := &bytes.Buffer{}
+	tee := io.TeeReader(r, buf)
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		io.Copy(pw, tee) // S3アップロード用
+	}()
+	defer pr.Close()
+
+	key, err := objectstorage.MailUploadObject(
+		pr,
+		conf.ObjectStorage.Region,
+		conf.ObjectStorage.Endpoint,
+		conf.ObjectStorage.Bucket,
+		conf.ObjectStorage.AccessKey,
+		conf.ObjectStorage.SecretKey,
+	)
+	if err != nil {
+		log.Fatalf("Error uploading object: %v", err)
+	}
+	log.Printf("Object uploaded with key: %s", key)
+	if err := savemail.SaveMailMetaData(s.username, buf, key, int64(buf.Len()), db, s.mailboxID); err != nil {
+		log.Fatalf("Error adding mail metadata: %v", err)
+	}
+	log.Printf("Mail metadata added successfully for key: %s", key)
+
+	return nil, nil
 }
 
 func (s *Session) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
@@ -292,7 +494,121 @@ func (s *Session) Unselect() error {
 
 func (s *Session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
 	log.Println(pp.Sprintf("Expunge called with uids: %v", uids))
+
+	if uids == nil || len(*uids) == 0 {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "UIDs cannot be nil",
+		}
+	}
+
+	for _, uid := range *uids {
+		log.Printf("Expunging message with UID: %d", uid)
+		var metaData model.MessageMetaData
+		tx := db.Begin()
+		if err := db.Where("user = ? AND mailbox_id = ? AND id = ?",
+			s.username,
+			s.mailboxID,
+			uid).First(&metaData).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				tx.Rollback()
+				log.Printf("Message with UID %d not found for user %s", uid, s.username)
+				continue
+			}
+			tx.Rollback()
+			return fmt.Errorf("error finding message metadata: %v", err)
+		}
+
+		// メッセージを削除
+		if err := tx.Delete(&metaData).Error; err != nil {
+			tx.Rollback()
+			return fmt.Errorf("error deleting message metadata: %v", err)
+		}
+
+		if err := tx.Commit().Error; err != nil {
+			tx.Rollback()
+			return fmt.Errorf("error committing transaction: %v", err)
+		}
+
+		// オブジェクトストレージからも削除
+		if err := objectstorage.DeleteObject(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey); err != nil {
+			log.Printf("Error deleting object from storage: %v", err)
+			continue
+		}
+	}
+
 	return nil
+}
+
+// flagで指定されたフラグを検索し、imap.SearchDataを返す
+func SearchFlag(flag imap.Flag, username string, mailboxID uint64) (*imap.SearchData, error) {
+	log.Println(pp.Sprintf("SearchFlag called with flag: %s, username: %s", flag, username))
+
+	var messageMetaData []model.MessageMetaData
+	if err := db.Model(&model.MessageMetaData{}).Where(
+		"user = ? AND mailbox_id = ? AND JSON_CONTAINS(flags, ?) = 1",
+		username,
+		mailboxID,
+		fmt.Sprintf("%q", flag),
+	).Find(&messageMetaData).Error; err != nil {
+		return nil, err
+	}
+
+	maxID := uint32(0)
+	minID := uint32(0)
+	idList := make([]uint32, 0, len(messageMetaData))
+	for _, meta := range messageMetaData {
+		idList = append(idList, uint32(meta.ID))
+		if meta.ID > uint64(maxID) {
+			maxID = uint32(meta.ID)
+		}
+		if minID == 0 || meta.ID < uint64(minID) {
+			minID = uint32(meta.ID)
+		}
+	}
+
+	return &imap.SearchData{
+		UID:   true,
+		All:   imap.SeqSetNum(idList...),
+		Min:   minID,
+		Max:   maxID,
+		Count: uint32(len(messageMetaData)),
+	}, nil
+}
+
+// flagで指定されたフラグが無い場合の検索
+func SearchFlagNot(flag imap.Flag, username string, mailboxID uint64) (*imap.SearchData, error) {
+	log.Println(pp.Sprintf("SearchFlagNot called with flag: %s, username: %s", flag, username))
+	var messageMetaData []model.MessageMetaData
+	if err := db.Model(&model.MessageMetaData{}).Where(
+		"user = ? AND mailbox_id = ? AND JSON_CONTAINS(flags, ?) = 0",
+		username,
+		mailboxID,
+		fmt.Sprintf("%q", flag),
+	).Find(&messageMetaData).Error; err != nil {
+		return nil, err
+	}
+
+	maxID := uint32(0)
+	minID := uint32(0)
+	idList := make([]uint32, 0, len(messageMetaData))
+	for _, meta := range messageMetaData {
+		idList = append(idList, uint32(meta.ID))
+		if meta.ID > uint64(maxID) {
+			maxID = uint32(meta.ID)
+		}
+		if minID == 0 || meta.ID < uint64(minID) {
+			minID = uint32(meta.ID)
+		}
+	}
+
+	return &imap.SearchData{
+		UID:   true,
+		All:   imap.SeqSetNum(idList...),
+		Min:   minID,
+		Max:   maxID,
+		Count: uint32(len(messageMetaData)),
+	}, nil
 }
 
 func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
@@ -306,41 +622,14 @@ func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	}
 
 	if criteria != nil {
+		// ToDo: 検索条件に応じて処理を分岐
+		// 本当は複数の条件をサポートするが、現状は単一のフラグ検索のみ
 		for _, flag := range criteria.Flag {
-			if flag == imap.FlagDeleted {
+			return SearchFlag(flag, s.username, s.mailboxID)
+		}
 
-				// 削除フラグ付きのメールを検索
-				// いったん空を返してみる
-				return &imap.SearchData{
-					UID:   true,
-					All:   imap.SeqSetNum(),
-					Min:   0,
-					Max:   0,
-					Count: 0,
-				}, nil
-			}
-			if flag == imap.FlagAnswered {
-				// 返信済みのメールを検索
-				// いったん空を返してみる
-				return &imap.SearchData{
-					UID:   true,
-					All:   imap.SeqSetNum(),
-					Min:   0,
-					Max:   0,
-					Count: 0,
-				}, nil
-			}
-			if flag == imap.FlagDraft {
-				// 下書きのメールを検索
-				// いったん空を返してみる
-				return &imap.SearchData{
-					UID:   true,
-					All:   imap.SeqSetNum(),
-					Min:   0,
-					Max:   0,
-					Count: 0,
-				}, nil
-			}
+		for _, flag := range criteria.NotFlag {
+			return SearchFlagNot(flag, s.username, s.mailboxID)
 		}
 
 		// 件数
@@ -412,48 +701,66 @@ func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 
 // Envelopeを返す関数
 func buildEnvelope(m *model.MessageMetaData) *imap.Envelope {
-	name, mbox, host := mailparser.ParseAddress(m.FromRaw)
-	from := []imap.Address{
-		{
-			Mailbox: mbox,
-			Host:    host,
-			Name:    name,
-		},
-	}
-	name, mbox, host = mailparser.ParseAddress(m.ToRaw)
-	to := []imap.Address{
-		{
-			Mailbox: mbox,
-			Host:    host,
-			Name:    name,
-		},
-	}
-	name, mbox, host = mailparser.ParseAddress(m.CcRaw)
-	cc := []imap.Address{
-		{
-			Mailbox: mbox,
-			Host:    host,
-			Name:    name,
-		},
-	}
-	name, mbox, host = mailparser.ParseAddress(m.BccRaw)
-	bcc := []imap.Address{
-		{
-			Mailbox: mbox,
-			Host:    host,
-			Name:    name,
-		},
+	if m == nil || m.Headers == nil {
+		return nil
 	}
 
-	return &imap.Envelope{
-		Subject:   m.Subject,
-		From:      from,
-		To:        to,
-		Cc:        cc,
-		Bcc:       bcc,
-		MessageID: m.MessageID,
-		Date:      m.Timestamp,
+	var envelope imap.Envelope
+
+	if from, ok := m.Headers["From"]; ok && len(from) > 0 {
+		var f []imap.Address
+		for _, addr := range from {
+			name, mbox, host := mailparser.ParseAddress(addr)
+			f = append(f, imap.Address{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			})
+		}
+		envelope.From = f
 	}
+	if to, ok := m.Headers["To"]; ok && len(to) > 0 {
+		var t []imap.Address
+		for _, addr := range to {
+			name, mbox, host := mailparser.ParseAddress(addr)
+			t = append(t, imap.Address{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			})
+		}
+		envelope.To = t
+	}
+	if cc, ok := m.Headers["Cc"]; ok && len(cc) > 0 {
+		var c []imap.Address
+		for _, addr := range cc {
+			name, mbox, host := mailparser.ParseAddress(addr)
+			c = append(c, imap.Address{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			})
+		}
+		envelope.Cc = c
+	}
+	if bcc, ok := m.Headers["Bcc"]; ok && len(bcc) > 0 {
+		var b []imap.Address
+		for _, addr := range bcc {
+			name, mbox, host := mailparser.ParseAddress(addr)
+			b = append(b, imap.Address{
+				Mailbox: mbox,
+				Host:    host,
+				Name:    name,
+			})
+		}
+		envelope.Bcc = b
+	}
+	if messageID, ok := m.Headers["Message-ID"]; ok && len(messageID) > 0 {
+		envelope.MessageID = messageID[0]
+	}
+	envelope.Date = m.Timestamp
+
+	return &envelope
 }
 
 func fetch(metaData model.MessageMetaData, seqNum uint32, w *imapserver.FetchWriter, opts *imap.FetchOptions) error {
@@ -569,8 +876,10 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 			stop := seqnum.Stop
 			var m []model.MessageMetaData
 			if err := db.
-				Where("user = ?", s.username).
-				Offset(int(start - 1)).
+				Where("user = ? AND mailbox_id = ?",
+					s.username,
+					s.mailboxID,
+				).Offset(int(start - 1)).
 				Limit(int(stop - start + 1)).
 				Find(&m).Error; err != nil {
 				return err
@@ -611,11 +920,31 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 			var metaData []model.MessageMetaData
 			log.Println(pp.Sprintf("Fetching message with UID: %d", uid))
 			// uid.Startとuid.Stopで範囲を取得
-			if err := db.Where("user = ? AND (id >= ? AND id <= ?)", s.username, uid.Start, uid.Stop).
-				Find(&metaData).Error; err != nil {
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Text: fmt.Sprintf("Message with UID %d not found", uid),
+			// Stopが0の場合は、fetch <Start>:*が指定されているとみなす
+			if uid.Stop != 0 {
+				if err := db.Where(
+					"user = ? AND mailbox_id = ? AND(id >= ? AND id <= ?)",
+					s.username,
+					s.mailboxID,
+					uid.Start,
+					uid.Stop,
+				).Find(&metaData).Error; err != nil {
+					return &imap.Error{
+						Type: imap.StatusResponseTypeNo,
+						Text: fmt.Sprintf("Message with UID %d not found", uid),
+					}
+				}
+			} else {
+				if err := db.Where(
+					"user = ? AND mailbox_id = ? AND id  >= ?",
+					s.username,
+					s.mailboxID,
+					uid.Start,
+				).Find(&metaData).Error; err != nil {
+					return &imap.Error{
+						Type: imap.StatusResponseTypeNo,
+						Text: fmt.Sprintf("Message with UID %d not found", uid),
+					}
 				}
 			}
 			messages = append(messages, metaData...)
@@ -645,6 +974,8 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 
 func (s *Session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
 	log.Println(pp.Sprintf("Store called with numSet: %v, flags: %v, options: %v", numSet, flags, options))
+	// フラグの更新処理
+
 	if flags == nil || len(flags.Flags) == 0 {
 		return &imap.Error{
 			Type: imap.StatusResponseTypeBad,
@@ -721,5 +1052,132 @@ func flagsRemove(slice []string, item string) []string {
 
 func (s *Session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) {
 	log.Println(pp.Sprintf("Copy called with numSet: %v, dest: %s", numSet, dest))
-	return nil, errors.New("Copy not implemented")
+
+	if dest == "" {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "Destination mailbox cannot be empty",
+		}
+	}
+
+	numSetUID, ok := numSet.(imap.UIDSet)
+	if !ok {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "COPY only supports UIDSet",
+		}
+	}
+
+	// numSetUIDからメッセージを取得
+	var messageMetaData []model.MessageMetaData
+	tx := db.Begin()
+	for _, uid := range numSetUID {
+		var metaData []model.MessageMetaData
+		// uid.Startとuid.Stopで範囲を取得
+		if uid.Stop != 0 {
+			if err := tx.Where(
+				"user = ? AND mailbox_id = ? AND(id >= ? AND id <= ?)",
+				s.username,
+				s.mailboxID,
+				uid.Start,
+				uid.Stop,
+			).Find(&metaData).Error; err != nil {
+				tx.Rollback()
+				return nil, &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: fmt.Sprintf("Message with UID %d not found", uid),
+				}
+			}
+		} else {
+			if err := tx.Where(
+				"user = ? AND mailbox_id = ? AND id >= ?",
+				s.username,
+				s.mailboxID,
+				uid.Start,
+			).Find(&metaData).Error; err != nil {
+				tx.Rollback()
+				return nil, &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: fmt.Sprintf("Message with UID %d not found", uid),
+				}
+			}
+		}
+		messageMetaData = append(messageMetaData, metaData...)
+	}
+
+	// destからメールボックスを取得
+	if dest != "INBOX" {
+		var mailbox model.Mailbox
+		if err := tx.Where("name = ? AND user = ?", dest, s.username).First(&mailbox).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				tx.Rollback()
+				return nil, &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: "Destination mailbox does not exist",
+				}
+			}
+			tx.Rollback()
+			return nil, fmt.Errorf("error finding destination mailbox: %v", err)
+		}
+		s.mailboxID = mailbox.ID
+		s.mailbox = dest
+	} else {
+		s.mailboxID = 0 // INBOXのIDは0とする
+		s.mailbox = "INBOX"
+	}
+
+	// メッセージのコピー処理
+	for _, metaData := range messageMetaData {
+		// オブジェクトストレージからメッセージをダウンロード
+		obj, err := objectstorage.ObjectDownload(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey)
+		if err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("error downloading object: %v", err)
+		}
+		defer obj.Close()
+
+		// オブジェクトストレージにコピー
+		key, err := objectstorage.MailUploadObject(
+			obj,
+			conf.ObjectStorage.Region,
+			conf.ObjectStorage.Endpoint,
+			conf.ObjectStorage.Bucket,
+			conf.ObjectStorage.AccessKey,
+			conf.ObjectStorage.SecretKey,
+		)
+		if err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("error uploading object: %v", err)
+		}
+
+		log.Printf("Object copied with key: %s", key)
+
+		// メタデータを新しいメールボックスに追加
+		newMetaData := model.MessageMetaData{
+			User:             s.username,
+			Subject:          metaData.Subject,
+			From:             metaData.From,
+			To:               metaData.To,
+			Cc:               metaData.Cc,
+			Bcc:              metaData.Bcc,
+			MailboxID:        s.mailboxID,
+			ObjectStorageKey: key,
+			Size:             metaData.Size,
+			Flags:            metaData.Flags,
+			Headers:          metaData.Headers,
+			HasAttachments:   metaData.HasAttachments,
+			Timestamp:        metaData.Timestamp,
+		}
+		if err := tx.Create(&newMetaData).Error; err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("error creating new message metadata: %v", err)
+		}
+		log.Printf("New message metadata created with ID: %d", newMetaData.ID)
+	}
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error committing transaction: %v", err)
+	}
+
+	return nil, nil
 }
