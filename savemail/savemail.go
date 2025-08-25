@@ -46,7 +46,7 @@ func SaveMailMetaData(user string, r io.Reader, objKey string, size int64, db *g
 		log.Fatalf("Error reading message: %v", err)
 	}
 
-	// Date To time.Time conversion
+	// Date to time.Time conversion
 	timestamp, _ := msg.Header.Date()
 
 	hasAttachments, err := hasAttachments(msg)
@@ -54,7 +54,7 @@ func SaveMailMetaData(user string, r io.Reader, objKey string, size int64, db *g
 		return fmt.Errorf("error checking for attachments: %v", err)
 	}
 
-	// subject decoding
+	// Subject decoding
 	subject := msg.Header.Get("Subject")
 	decodedSubject, err := mailparser.DecodeHeader(subject)
 	if err != nil {
@@ -82,24 +82,24 @@ func SaveMailMetaData(user string, r io.Reader, objKey string, size int64, db *g
 		decodedBcc = msg.Header.Get("Bcc") // Fallback to original Bcc if decoding fails
 	}
 
-	// SPAM判定
-	// X-Vade-Spamscoreを取り出し、500以上、9999以下ならSPAMとする
+	// SPAM detection
+	// Extract X-Vade-Spamscore and mark as SPAM if 500 or higher and less than 9999
 	spamScore := msg.Header.Get("X-Vade-Spamscore")
 	score, err := strconv.Atoi(spamScore)
 	if err != nil {
 		log.Printf("Error converting spam score to integer: %v", err)
 	}
 
-	// トランザクションの開始
+	// Start transaction
 	tx := db.Begin()
 	if score >= 500 && score <= 9999 {
 		log.Printf("SPAM detected with score: %d from msg ID: %s", score, msg.Header.Get("Message-ID"))
-		// SPAMの場合はINBOXではなくSPAMフォルダに保存する
+		// Save to SPAM folder instead of INBOX if it's SPAM
 		var spamMailbox model.Mailbox
-		// SPAMフォルダのIDを取得
+		// Get ID of SPAM folder
 		if err := tx.Where("user = ? AND name = ?", msg.Header.Get("Delivered-To"), "SPAM").First(&spamMailbox).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
-				// SPAMフォルダが存在しない場合は作成
+				// Create SPAM folder if it doesn't exist
 				spamMailbox = model.Mailbox{
 					Name: "SPAM",
 					User: msg.Header.Get("Delivered-To"),
@@ -113,7 +113,7 @@ func SaveMailMetaData(user string, r io.Reader, objKey string, size int64, db *g
 				return fmt.Errorf("error finding SPAM mailbox: %v", err)
 			}
 		}
-		mailboxID = spamMailbox.ID // SPAMフォルダのIDを使用
+		mailboxID = spamMailbox.ID // Use SPAM folder ID
 	}
 
 	if user == "" {

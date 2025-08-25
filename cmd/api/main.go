@@ -28,7 +28,7 @@ var (
 func getList(c echo.Context) error {
 	var messages []model.MessageMetaData
 
-	// CreatedAtで降順にソート
+	// Sort by CreatedAt in descending order
 	if err := db.Order("created_at DESC").Find(&messages).Error; err != nil {
 		return c.JSON(500, map[string]string{"error": "Failed to fetch messages"})
 	}
@@ -116,7 +116,7 @@ func main() {
 		e.Logger.Fatal("Migration failed:", err)
 	}
 
-	// ルーティング
+	// Routing
 	e.GET("/api/list", getList)
 	e.GET("/api/message/:id", getMessage)
 	/*

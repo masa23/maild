@@ -15,7 +15,7 @@ import (
 	"github.com/valyala/gozstd"
 )
 
-// オブジェクトが存在するか
+// Check if object exists
 func ObjectExists(s3Client *s3.S3, bucket, key string) (bool, error) {
 	resp, err := s3Client.HeadObject(&s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
@@ -34,10 +34,10 @@ func ObjectExists(s3Client *s3.S3, bucket, key string) (bool, error) {
 	return resp != nil, nil
 }
 
-// オブジェクトをアップロードする zstd圧縮する
-// ToDo: bufを使っているのでメモリ効率が悪い
+// Upload object with zstd compression
+// ToDo: Memory efficiency could be improved as buf is used
 func UploadObjectWithZstd(s3Client *s3.S3, bucket, key string, reader io.Reader) error {
-	// zstd圧縮する
+	// Compress with zstd
 	var buf bytes.Buffer
 	zw := gozstd.NewWriter(&buf)
 	if _, err := io.Copy(zw, reader); err != nil {
@@ -58,8 +58,8 @@ func UploadObjectWithZstd(s3Client *s3.S3, bucket, key string, reader io.Reader)
 	return nil
 }
 
-// オブジェクトをアップロードする
-// ToDo: bufを使っているのでメモリ効率が悪い
+// Upload object
+// ToDo: Memory efficiency could be improved as buf is used
 func UploadObject(s3Client *s3.S3, bucket, key string, reader io.Reader) error {
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, reader); err != nil {
@@ -77,7 +77,7 @@ func UploadObject(s3Client *s3.S3, bucket, key string, reader io.Reader) error {
 	return nil
 }
 
-// 現在の時刻でオブジェクトのキーを生成する
+// Generate object key with current timestamp
 // YYYY/MM/DD/HH/mm/ss/UUID
 func GenerateObjectKey() string {
 	now := time.Now()
@@ -116,7 +116,7 @@ func MailUploadObject(r io.Reader, region, endpoint, bucket, accessKey, secretKe
 		break
 	}
 
-	/* 開発中なのでzstd圧縮はしない
+	/* Development: zstd compression is disabled
 	if err := objectstorage.UploadObjectWithZstd(s3Client, conf.ObjectStorage.Bucket, key, pr); err != nil {
 		log.Fatalf("Error uploading object to S3: %v", err)
 	}

@@ -23,13 +23,13 @@ var (
 func inboxToSpam() error {
 	messages := []model.MessageMetaData{}
 
-	// INBOXの全件取得
+	// Get all messages from INBOX
 	if err := db.Where("mailbox_id = ?", 0).Find(&messages).Error; err != nil {
 		return err
 	}
 
 	for _, msg := range messages {
-		// HeaderからSPAMスコアを取得
+		// Get SPAM score from headers
 		scoreStr := msg.Headers["X-Vade-Spamscore"]
 		if len(scoreStr) == 0 {
 			log.Printf("No spam score found for message ID %d", msg.ID)
@@ -46,10 +46,10 @@ func inboxToSpam() error {
 		if score >= 500 && score <= 9999 {
 			log.Printf("Moving message ID %d with score %d to SPAM folder", msg.ID, score)
 
-			// SPAMフォルダのIDを取得
+			// Get ID of SPAM folder
 			var spamMailbox model.Mailbox
 			if err := db.Where("name = ? AND user = ?", "SPAM", msg.User).First(&spamMailbox).Error; errors.Is(err, gorm.ErrRecordNotFound) {
-				// SPAMフォルダが存在しない場合は作成
+				// Create SPAM folder if it doesn't exist
 				spamMailbox = model.Mailbox{
 					Name: "SPAM",
 					User: msg.User,
@@ -63,7 +63,7 @@ func inboxToSpam() error {
 				continue
 			}
 
-			// メッセージのMailboxIDを更新
+			// Update message's MailboxID
 			msg.MailboxID = spamMailbox.ID
 			if err := db.Save(&msg).Error; err != nil {
 				log.Printf("Error updating message mailbox ID: %v", err)
