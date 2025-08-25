@@ -18,6 +18,7 @@ func DecodeHeader(header string) (string, error) {
 			return input, nil
 		}
 	}
+	// ヘッダーをデコード
 	decoded, err := dec.DecodeHeader(header)
 	if err != nil {
 		return "", err

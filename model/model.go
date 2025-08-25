@@ -7,6 +7,7 @@ import (
 )
 
 func Migrate(db *gorm.DB) error {
+	// データベーススキーマをマイグレーション
 	return db.AutoMigrate(
 		&MessageMetaData{},
 		&Mailbox{},

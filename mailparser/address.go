@@ -65,7 +65,7 @@ func ParseAddressList(s string) ([]string, error) {
 	return addresses, nil
 }
 
-// Fromのヘッダからメールアドレスを取り出す
+// Fromヘッダからメールアドレスを取り出す
 func ParseAddress(s string) (name, mbox, host string) {
 	var address string
 	var quoted bool
