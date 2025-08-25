@@ -1,7 +1,6 @@
 package imapsession
 
 import (
-	"errors"
 	"log"
 
 	"github.com/k0kubun/pp/v3"
@@ -12,15 +11,20 @@ import (
 // Login implements the IMAP LOGIN command
 func (s *Session) Login(username, password string) error {
 	log.Println(pp.Sprintf("Login called with username: %s", username))
-	// ToDo: authentication process
-	s.username = "test@mail.masa23.jp"
+	// For now, we'll accept any username/password combination
+	// In a real implementation, this would validate against a user database
+	s.username = username
 	return nil
 }
 
 // Logout implements the IMAP LOGOUT command
 func (s *Session) Logout() error {
 	log.Println(pp.Sprintf("Logout called"))
-	return errors.New("Logout is not implemented")
+	// Reset session state
+	s.username = ""
+	s.mailbox = ""
+	s.mailboxID = 0
+	return nil
 }
 
 // Close implements the IMAP CLOSE command
@@ -38,7 +42,9 @@ func (s *Session) Unselect() error {
 // Idle implements the IMAP IDLE command
 func (s *Session) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
 	log.Println(pp.Sprintf("Idle called"))
-	return errors.New("Idle is not implemented")
+	// Simple implementation that just waits for stop signal
+	<-stop
+	return nil
 }
 
 // Poll implements the IMAP POLL command

@@ -96,7 +96,7 @@ func (s *Session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 		"user = ? AND mailbox_id = ? AND JSON_CONTAINS(flags, ?) = 0",
 		s.username,
 		mailboxID,
-		fmt.Sprintf("%q", imap.FlagDeleted),
+		fmt.Sprintf("%q", imap.FlagSeen),
 	).Count(&unseenCount).Error; err != nil {
 		return nil, err
 	}

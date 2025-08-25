@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 
 	"github.com/masa23/maild/config"
+	"github.com/masa23/maild/mailope"
 	"github.com/masa23/maild/model"
 	"github.com/masa23/maild/objectstorage"
-	"github.com/masa23/maild/savemail"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -88,9 +88,8 @@ func main() {
 		log.Fatalf("Error uploading object: %v", err)
 	}
 	log.Printf("Object uploaded with key: %s", key)
-	if err := savemail.SaveMailMetaData("", buf, key, int64(buf.Len()), db, 0); err != nil {
+	if err := mailope.SaveMetaData("", buf, key, int64(buf.Len()), db, 0); err != nil {
 		log.Fatalf("Error adding mail metadata: %v", err)
 	}
 	log.Printf("Mail metadata added successfully for key: %s", key)
 }
-

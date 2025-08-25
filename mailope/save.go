@@ -1,4 +1,4 @@
-package savemail
+package mailope
 
 import (
 	"fmt"
@@ -40,7 +40,7 @@ func hasAttachments(msg *mail.Message) (bool, error) {
 	return false, nil
 }
 
-func SaveMailMetaData(user string, r io.Reader, objKey string, size int64, db *gorm.DB, mailboxID uint64) error {
+func SaveMetaData(user string, r io.Reader, objKey string, size int64, db *gorm.DB, mailboxID uint64) error {
 	msg, err := mail.ReadMessage(r)
 	if err != nil {
 		log.Fatalf("Error reading message: %v", err)

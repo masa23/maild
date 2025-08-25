@@ -10,19 +10,20 @@ import (
 	"strings"
 
 	"github.com/k0kubun/pp/v3"
+	"github.com/masa23/maild/mailope"
 	"github.com/masa23/maild/mailparser"
 	"github.com/masa23/maild/model"
 	"github.com/masa23/maild/objectstorage"
-	"github.com/masa23/maild/savemail"
 	"gorm.io/gorm"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 )
 
-// Append implementsmthe plements thecommandND command
+// Append implements the IMAP APPEND command
 func (s *Session) Append(mailbox string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
-	log.Println(pp.Sprintf("Append calledawith lled with mailbox: %s, o", mailbox, options))
+	log.Println(pp.Sprintf("Append called with mailbox: %s, options: %v, session: %v", mailbox, options, s))
+	var mailboxID uint64
 
 	if mailbox == "" {
 		return nil, &imap.Error{
@@ -32,8 +33,7 @@ func (s *Session) Append(mailbox string, r imap.LiteralReader, options *imap.App
 	}
 
 	if mailbox == "INBOX" {
-		s.mailboxID = 0 // INBOXのIDは0とする
-		s.mailbox = "INBOX"
+		mailboxID = 0 // INBOXのIDは0とする
 	} else {
 		// メールボックスを取得
 		var mailboxData model.Mailbox
@@ -46,8 +46,7 @@ func (s *Session) Append(mailbox string, r imap.LiteralReader, options *imap.App
 			}
 			return nil, fmt.Errorf("error finding mailbox: %v", err)
 		}
-		s.mailboxID = mailboxData.ID
-		s.mailbox = mailbox
+		mailboxID = mailboxData.ID
 	}
 
 	// DBとオブジェクトストレージに保存
@@ -73,7 +72,7 @@ func (s *Session) Append(mailbox string, r imap.LiteralReader, options *imap.App
 		log.Fatalf("Error uploading object: %v", err)
 	}
 	log.Printf("Object uploaded with key: %s", key)
-	if err := savemail.SaveMailMetaData(s.username, buf, key, int64(buf.Len()), db, s.mailboxID); err != nil {
+	if err := mailope.SaveMetaData(s.username, buf, key, int64(buf.Len()), db, mailboxID); err != nil {
 		log.Fatalf("Error adding mail metadata: %v", err)
 	}
 	log.Printf("Mail metadata added successfully for key: %s", key)
@@ -81,15 +80,41 @@ func (s *Session) Append(mailbox string, r imap.LiteralReader, options *imap.App
 	return nil, nil
 }
 
+func (s *Session) deleteFlagAllDelete() error {
+	var mails []model.MessageMetaData
+	if err := db.Where("user = ? AND mailbox_id = ? AND JSON_CONTAINS(flags, ?) = 1",
+		s.username,
+		s.mailboxID,
+		fmt.Sprintf("%q", imap.FlagDeleted),
+	).Find(&mails).Error; err != nil {
+		return fmt.Errorf("error finding messages: %v", err)
+	}
+
+	for _, mail := range mails {
+		if err := db.Delete(&mail).Error; err != nil {
+			return fmt.Errorf("error deleting message metadata: %v", err)
+		}
+
+		// オブジェクトストレージからも削除
+		if err := objectstorage.DeleteObject(s3Client, conf.ObjectStorage.Bucket, mail.ObjectStorageKey); err != nil {
+			log.Printf("Error deleting object from storage: %v", err)
+			continue
+		}
+	}
+
+	return nil
+}
+
 // Expunge implements the IMAP EXPUNGE command
 func (s *Session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
-	log.Println(pp.Sprintf("Expunge called with uids: %v", uids))
+	log.Println(pp.Sprintf("Expunge called with uids: %v, session: %v", uids, s))
 
 	if uids == nil || len(*uids) == 0 {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeBad,
-			Text: "UIDs cannot be nil",
+		// 現在のメールボックスのメールを削除する
+		if err := s.deleteFlagAllDelete(); err != nil {
+			return fmt.Errorf("error deleting all messages: %v", err)
 		}
+		return nil
 	}
 
 	for _, uid := range *uids {
@@ -103,7 +128,7 @@ func (s *Session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				tx.Rollback()
 				log.Printf("Message with UID %d not found for user %s", uid, s.username)
-				continue
+				return fmt.Errorf("message not found: %v", err)
 			}
 			tx.Rollback()
 			return fmt.Errorf("error finding message metadata: %v", err)
@@ -132,7 +157,7 @@ func (s *Session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 
 // Search implements the IMAP SEARCH command
 func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
-	log.Println(pp.Sprintf("Search called with kind: %v, criteria: %v, options: %v", kind, criteria, options))
+	log.Println(pp.Sprintf("Search called with kind: %v, criteria: %v, options: %v, session: %v", kind, criteria, options, s))
 
 	if kind != imapserver.NumKindUID {
 		return nil, &imap.Error{
@@ -142,44 +167,166 @@ func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	}
 
 	if criteria != nil {
-		// ToDo: 検索条件に応じて処理を分岐
-		// 本当は複数の条件をサポートするが、現状は単一のフラグ検索のみ
-		for _, flag := range criteria.Flag {
-			return SearchFlag(flag, s.username, s.mailboxID)
+		// Collect all matching message IDs from Flag conditions (AND logic)
+		var flagResults []uint32
+		if len(criteria.Flag) > 0 {
+			// Process all flags in criteria.Flag and combine results
+			for i, flag := range criteria.Flag {
+				result, err := SearchFlag(flag, s.username, s.mailboxID)
+				if err != nil {
+					return nil, err
+				}
+
+				// Convert NumSet to []uint32 for processing
+				var currentResults []uint32
+				if result.All != nil {
+					// We need to convert the NumSet to a slice of uint32
+					// Since we can't directly call Numbers(), we'll use a different approach
+					// Extract all numbers from the NumSet by iterating through it
+					switch v := result.All.(type) {
+					case imap.UIDSet:
+						for _, uidRange := range v {
+							for uid := uidRange.Start; uid <= uidRange.Stop; uid++ {
+								currentResults = append(currentResults, uint32(uid))
+							}
+						}
+					case imap.SeqSet:
+						for _, seqRange := range v {
+							for seq := seqRange.Start; seq <= seqRange.Stop; seq++ {
+								currentResults = append(currentResults, uint32(seq))
+							}
+						}
+					}
+				}
+
+				// For the first flag, use all results
+				if i == 0 {
+					flagResults = currentResults
+				} else {
+					// For subsequent flags, intersect with previous results
+					// This implements AND logic between flags
+					var intersection []uint32
+					for _, prevID := range currentResults {
+						for _, currID := range flagResults {
+							if prevID == currID {
+								intersection = append(intersection, prevID)
+								break
+							}
+						}
+					}
+					flagResults = intersection
+				}
+			}
 		}
 
-		for _, flag := range criteria.NotFlag {
-			return SearchFlagNot(flag, s.username, s.mailboxID)
+		// Collect all matching message IDs from NotFlag conditions (AND logic)
+		var notFlagResults []uint32
+		if len(criteria.NotFlag) > 0 {
+			// Process all flags in criteria.NotFlag and combine results
+			for i, flag := range criteria.NotFlag {
+				result, err := SearchFlagNot(flag, s.username, s.mailboxID)
+				if err != nil {
+					return nil, err
+				}
+
+				// Convert NumSet to []uint32 for processing
+				var currentResults []uint32
+				if result.All != nil {
+					// We need to convert the NumSet to a slice of uint32
+					switch v := result.All.(type) {
+					case imap.UIDSet:
+						for _, uidRange := range v {
+							for uid := uidRange.Start; uid <= uidRange.Stop; uid++ {
+								currentResults = append(currentResults, uint32(uid))
+							}
+						}
+					case imap.SeqSet:
+						for _, seqRange := range v {
+							for seq := seqRange.Start; seq <= seqRange.Stop; seq++ {
+								currentResults = append(currentResults, uint32(seq))
+							}
+						}
+					}
+				}
+
+				// For the first flag, use all results
+				if i == 0 {
+					notFlagResults = currentResults
+				} else {
+					// For subsequent flags, intersect with previous results
+					// This implements AND logic between not flags
+					var intersection []uint32
+					for _, prevID := range currentResults {
+						for _, currID := range notFlagResults {
+							if prevID == currID {
+								intersection = append(intersection, prevID)
+								break
+							}
+						}
+					}
+					notFlagResults = intersection
+				}
+			}
 		}
 
-		// 件数
-		var count int64
-		if err := db.Model(&model.MessageMetaData{}).Where("user = ?", s.username).Count(&count).Error; err != nil {
-			return nil, err
+		// Combine flag and not flag results
+		// If both flag and not flag conditions exist, we need to exclude not flag results from flag results
+		var finalResults []uint32
+		if len(flagResults) > 0 && len(notFlagResults) > 0 {
+			// Exclude not flag results from flag results
+			for _, flagID := range flagResults {
+				found := false
+				for _, notFlagID := range notFlagResults {
+					if flagID == notFlagID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					finalResults = append(finalResults, flagID)
+				}
+			}
+		} else if len(flagResults) > 0 {
+			// Only flag conditions exist
+			finalResults = flagResults
+		} else if len(notFlagResults) > 0 {
+			// Only not flag conditions exist
+			finalResults = notFlagResults
+		} else {
+			// No flag conditions, get all messages
+			var count int64
+			if err := db.Model(&model.MessageMetaData{}).Where("user = ? AND mailbox_id = ?", s.username, s.mailboxID).Count(&count).Error; err != nil {
+				return nil, err
+			}
+
+			var ids []uint32
+			if err := db.Model(&model.MessageMetaData{}).Where("user = ? AND mailbox_id = ?", s.username, s.mailboxID).Pluck("id", &ids).Error; err != nil {
+				return nil, err
+			}
+
+			finalResults = ids
 		}
-		// 一番小さいIDと最大のIDを取得
+
+		// Calculate min, max, and count
 		var minID, maxID uint32
+		count := len(finalResults)
 		if count > 0 {
-			var metaData model.MessageMetaData
-			if err := db.Where("user = ?", s.username).Order("id ASC").First(&metaData).Error; err != nil {
-				return nil, err
+			minID = finalResults[0]
+			maxID = finalResults[0]
+			for _, id := range finalResults {
+				if id < minID {
+					minID = id
+				}
+				if id > maxID {
+					maxID = id
+				}
 			}
-			minID = uint32(metaData.ID)
-			if err := db.Where("user = ?", s.username).Order("id DESC").First(&metaData).Error; err != nil {
-				return nil, err
-			}
-			maxID = uint32(metaData.ID)
 		} else {
 			minID = 0
 			maxID = 0
 		}
 
-		var ids []uint32
-		if err := db.Model(&model.MessageMetaData{}).Where("user = ?", s.username).Pluck("id", &ids).Error; err != nil {
-			return nil, err
-		}
-
-		seqnum := imap.SeqSetNum(ids...)
+		seqnum := imap.SeqSetNum(finalResults...)
 
 		return &imap.SearchData{
 			UID:   true,
@@ -221,7 +368,7 @@ func (s *Session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 
 // Fetch implements the IMAP FETCH command
 func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.FetchOptions) error {
-	log.Println(pp.Sprintf("Fetch called with set: %v, opts: %v", set, opts))
+	log.Println(pp.Sprintf("Fetch called with set: %v, opts: %v, session: %v", set, opts, s))
 
 	// UIDSetとSeqSetの両方をサポート
 	switch v := set.(type) {
@@ -348,7 +495,7 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, opts *imap.F
 
 // Store implements the IMAP STORE command
 func (s *Session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
-	log.Println(pp.Sprintf("Store called with numSet: %v, flags: %v, options: %v", numSet, flags, options))
+	log.Println(pp.Sprintf("Store called with numSet: %v, flags: %v, options: %v, session: %v", numSet, flags, options, s))
 	// フラグの更新処理
 
 	if flags == nil || len(flags.Flags) == 0 {
@@ -382,11 +529,27 @@ func (s *Session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 				metaData.Flags = []string{}
 				for _, flag := range flags.Flags {
 					metaData.Flags = append(metaData.Flags, string(flag))
+					if flag == imap.FlagDeleted {
+						if err := setDeleteFlag(&metaData, db); err != nil {
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Text: fmt.Sprintf("Failed to set delete flag: %v", err),
+							}
+						}
+					}
 				}
 			case imap.StoreFlagsAdd:
 				for _, flag := range flags.Flags {
 					if !flagsContains(metaData.Flags, string(flag)) {
 						metaData.Flags = append(metaData.Flags, string(flag))
+					}
+					if flag == imap.FlagDeleted {
+						if err := setDeleteFlag(&metaData, db); err != nil {
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Text: fmt.Sprintf("Failed to set delete flag: %v", err),
+							}
+						}
 					}
 				}
 			case imap.StoreFlagsDel:
@@ -407,9 +570,50 @@ func (s *Session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 	return nil
 }
 
+func setDeleteFlag(metaData *model.MessageMetaData, db *gorm.DB) error {
+	trashID, err := getTrashMailboxID(metaData.User, db)
+	if err != nil {
+		return err
+	}
+	// すでにTrashにあるメールにDeleteフラグを追加する場合はメールを削除する
+	if metaData.MailboxID == trashID {
+		if err := db.Delete(&metaData).Error; err != nil {
+			return err
+		}
+
+		// オブジェクトストレージからも削除
+		if err := objectstorage.DeleteObject(s3Client, conf.ObjectStorage.Bucket, metaData.ObjectStorageKey); err != nil {
+			log.Printf("Error deleting object from storage: %v", err)
+			return err
+		}
+	}
+
+	metaData.MailboxID = trashID
+	return nil
+}
+
+func getTrashMailboxID(username string, db *gorm.DB) (uint64, error) {
+	var mailbox model.Mailbox
+	if err := db.Where("name = ? AND user = ?", "Trash", username).First(&mailbox).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// ない場合は作成して返す
+			mailbox = model.Mailbox{
+				Name: "Trash",
+				User: username,
+			}
+			if err := db.Create(&mailbox).Error; err != nil {
+				return 0, fmt.Errorf("error creating Trash mailbox: %v", err)
+			}
+			return mailbox.ID, nil
+		}
+		return 0, fmt.Errorf("error finding Trash mailbox: %v", err)
+	}
+	return mailbox.ID, nil
+}
+
 // Copy implements the IMAP COPY command
 func (s *Session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) {
-	log.Println(pp.Sprintf("Copy called with numSet: %v, dest: %s", numSet, dest))
+	log.Println(pp.Sprintf("Copy called with numSet: %v, dest: %s, session: %v", numSet, dest, s))
 
 	if dest == "" {
 		return nil, &imap.Error{
@@ -464,6 +668,9 @@ func (s *Session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 	}
 
 	// destからメールボックスを取得
+	// 重要な変更：コピー先のメールボックス情報を一時的に保持し、
+	// セッションのメールボックス情報は変更しない
+	var destMailboxID uint64
 	if dest != "INBOX" {
 		var mailbox model.Mailbox
 		if err := tx.Where("name = ? AND user = ?", dest, s.username).First(&mailbox).Error; err != nil {
@@ -477,11 +684,9 @@ func (s *Session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 			tx.Rollback()
 			return nil, fmt.Errorf("error finding destination mailbox: %v", err)
 		}
-		s.mailboxID = mailbox.ID
-		s.mailbox = dest
+		destMailboxID = mailbox.ID
 	} else {
-		s.mailboxID = 0 // INBOXのIDは0とする
-		s.mailbox = "INBOX"
+		destMailboxID = 0 // INBOXのIDは0とする
 	}
 
 	// メッセージのコピー処理
@@ -518,7 +723,7 @@ func (s *Session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 			To:               metaData.To,
 			Cc:               metaData.Cc,
 			Bcc:              metaData.Bcc,
-			MailboxID:        s.mailboxID,
+			MailboxID:        destMailboxID,
 			ObjectStorageKey: key,
 			Size:             metaData.Size,
 			Flags:            metaData.Flags,
@@ -538,16 +743,6 @@ func (s *Session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 	}
 
 	return nil, nil
-}
-
-// IsDraftsEmpty checks if the Drafts mailbox is empty for the current user
-func (s *Session) IsDraftsEmpty() (bool, error) {
-	return IsDraftsEmpty(s.username, db)
-}
-
-// GetDraftsStatus returns detailed status of the Drafts mailbox
-func (s *Session) GetDraftsStatus() (*DraftsStatus, error) {
-	return CheckDraftsStatus(s.username, db)
 }
 
 // SearchFlag searches for messages with a specific flag
@@ -845,101 +1040,4 @@ func fetch(metaData model.MessageMetaData, seqNum uint32, w *imapserver.FetchWri
 		return err
 	}
 	return nil
-}
-
-// IsDraftsEmpty checks if the Drafts mailbox is empty for a given user
-func IsDraftsEmpty(username string, db *gorm.DB) (bool, error) {
-	// Find the Drafts mailbox ID
-	var draftsMailbox model.Mailbox
-	if err := db.Where("name = ? AND user = ?", "Drafts", username).First(&draftsMailbox).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// If Drafts mailbox doesn't exist, it's effectively empty
-			return true, nil
-		}
-		return false, fmt.Errorf("error finding Drafts mailbox: %v", err)
-	}
-
-	// Count messages in the Drafts mailbox
-	var count int64
-	if err := db.Model(&model.MessageMetaData{}).Where(
-		"user = ? AND mailbox_id = ?",
-		username,
-		draftsMailbox.ID,
-	).Count(&count).Error; err != nil {
-		return false, fmt.Errorf("error counting messages in Drafts: %v", err)
-	}
-
-	// Return true if no messages found (empty)
-	return count == 0, nil
-}
-
-// CheckDraftsStatus provides detailed information about the Drafts mailbox status
-func CheckDraftsStatus(username string, db *gorm.DB) (*DraftsStatus, error) {
-	status := &DraftsStatus{}
-
-	// Find the Drafts mailbox
-	var draftsMailbox model.Mailbox
-	if err := db.Where("name = ? AND user = ?", "Drafts", username).First(&draftsMailbox).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// If Drafts mailbox doesn't exist, return empty status
-			status.Exists = false
-			status.IsEmpty = true
-			status.MessageCount = 0
-			status.UnseenCount = 0
-			return status, nil
-		}
-		return nil, fmt.Errorf("error finding Drafts mailbox: %v", err)
-	}
-
-	status.Exists = true
-	status.MailboxID = draftsMailbox.ID
-
-	// Get message count
-	var count int64
-	if err := db.Model(&model.MessageMetaData{}).Where(
-		"user = ? AND mailbox_id = ?",
-		username,
-		draftsMailbox.ID,
-	).Count(&count).Error; err != nil {
-		return nil, fmt.Errorf("error counting messages in Drafts: %v", err)
-	}
-	status.MessageCount = int(count)
-
-	// Get unseen message count
-	var unseenCount int64
-	if err := db.Model(&model.MessageMetaData{}).Where(
-		"user = ? AND mailbox_id = ? AND JSON_CONTAINS(flags, ?) = 0",
-		username,
-		draftsMailbox.ID,
-		fmt.Sprintf("%q", "\\Seen"),
-	).Count(&unseenCount).Error; err != nil {
-		return nil, fmt.Errorf("error counting unseen messages in Drafts: %v", err)
-	}
-	status.UnseenCount = int(unseenCount)
-
-	// Check if empty
-	status.IsEmpty = count == 0
-
-	// Get UIDNext (next available UID)
-	var metaData model.MessageMetaData
-	if err := db.Where(
-		"user = ? AND mailbox_id = ?",
-		username,
-		draftsMailbox.ID,
-	).Last(&metaData).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, fmt.Errorf("error finding last message metadata: %v", err)
-	}
-	status.UIDNext = metaData.ID + 1
-
-	return status, nil
-}
-
-// DraftsStatus holds information about the Drafts mailbox status
-type DraftsStatus struct {
-	Exists       bool
-	MailboxID    uint64
-	MessageCount int
-	UnseenCount  int
-	IsEmpty      bool
-	UIDNext      uint64
 }
