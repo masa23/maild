@@ -9,10 +9,18 @@ import (
 	"net/mail"
 	"strconv"
 	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/masa23/maild/mailparser"
 	"github.com/masa23/maild/model"
 	"gorm.io/gorm"
+)
+
+const (
+	SpamScoreMin = 100
+	SpamScoreMax = 9999
 )
 
 func hasAttachments(msg *mail.Message) (bool, error) {
@@ -40,50 +48,93 @@ func hasAttachments(msg *mail.Message) (bool, error) {
 	return false, nil
 }
 
+func sanitizeString(s string) string {
+	// Remove or replace invalid UTF-8 sequences
+	if !utf8.ValidString(s) {
+		v := make([]rune, 0, len(s))
+		for i, r := range s {
+			if r == utf8.RuneError {
+				_, size := utf8.DecodeRuneInString(s[i:])
+				if size == 1 {
+					// Invalid byte sequence, skip it
+					continue
+				}
+			}
+			v = append(v, r)
+		}
+		s = string(v)
+	}
+
+	// Remove control characters except tab and newline
+	return strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' {
+			return r
+		}
+		if unicode.IsControl(r) {
+			return -1 // Remove control characters
+		}
+		return r
+	}, s)
+}
+
+func decodeHeaderField(header mail.Header, field string) string {
+	value := header.Get(field)
+	decodedValue, err := mailparser.DecodeHeader(value)
+	if err != nil {
+		log.Printf("Error decoding %s header: %v", field, err)
+		return sanitizeString(value) // Fallback to original value if decoding fails
+	}
+	return sanitizeString(decodedValue)
+}
+
+func createSpamFolder(tx *gorm.DB, user string) (uint64, error) {
+	var spamMailbox model.Mailbox
+	// Get ID of SPAM folder
+	if err := tx.Where("user = ? AND name = ?", user, "SPAM").First(&spamMailbox).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			// Create SPAM folder if it doesn't exist
+			spamMailbox = model.Mailbox{
+				Name: "SPAM",
+				User: user,
+			}
+			if err := tx.Create(&spamMailbox).Error; err != nil {
+				return 0, fmt.Errorf("error creating SPAM mailbox: %v", err)
+			}
+		} else {
+			return 0, fmt.Errorf("error finding SPAM mailbox: %v", err)
+		}
+	}
+	return spamMailbox.ID, nil
+}
+
 func SaveMetaData(user string, r io.Reader, objKey string, size int64, db *gorm.DB, mailboxID uint64) error {
 	msg, err := mail.ReadMessage(r)
 	if err != nil {
-		log.Fatalf("Error reading message: %v", err)
+		log.Printf("Error reading message: %v", err)
+		return fmt.Errorf("error reading message: %v", err)
 	}
 
 	// Date to time.Time conversion
-	timestamp, _ := msg.Header.Date()
+	timestamp, err := msg.Header.Date()
+	if err != nil {
+		log.Printf("Error parsing date header: %v, using current time as fallback", err)
+		timestamp = time.Now()
+	}
 
 	hasAttachments, err := hasAttachments(msg)
 	if err != nil {
 		return fmt.Errorf("error checking for attachments: %v", err)
 	}
 
-	// Subject decoding
-	subject := msg.Header.Get("Subject")
-	decodedSubject, err := mailparser.DecodeHeader(subject)
-	if err != nil {
-		log.Printf("Error decoding subject=%s err=%v", subject, err)
-		decodedSubject = subject // Fallback to original subject if decoding fails
-	}
-	decodedFrom, err := mailparser.DecodeHeader(msg.Header.Get("From"))
-	if err != nil {
-		log.Printf("Error decoding From header: %v", err)
-		decodedFrom = msg.Header.Get("From") // Fallback to original From if decoding fails
-	}
-	decodedTo, err := mailparser.DecodeHeader(msg.Header.Get("To"))
-	if err != nil {
-		log.Printf("Error decoding To header: %v", err)
-		decodedTo = msg.Header.Get("To") // Fallback to original To if decoding fails
-	}
-	decodedCc, err := mailparser.DecodeHeader(msg.Header.Get("Cc"))
-	if err != nil {
-		log.Printf("Error decoding Cc header: %v", err)
-		decodedCc = msg.Header.Get("Cc") // Fallback to original Cc if decoding fails
-	}
-	decodedBcc, err := mailparser.DecodeHeader(msg.Header.Get("Bcc"))
-	if err != nil {
-		log.Printf("Error decoding Bcc header: %v", err)
-		decodedBcc = msg.Header.Get("Bcc") // Fallback to original Bcc if decoding fails
-	}
+	// Decode header fields
+	decodedSubject := decodeHeaderField(msg.Header, "Subject")
+	decodedFrom := decodeHeaderField(msg.Header, "From")
+	decodedTo := decodeHeaderField(msg.Header, "To")
+	decodedCc := decodeHeaderField(msg.Header, "Cc")
+	decodedBcc := decodeHeaderField(msg.Header, "Bcc")
 
 	// SPAM detection
-	// Extract X-Vade-Spamscore and mark as SPAM if 500 or higher and less than 9999
+	// Extract X-Vade-Spamscore and mark as SPAM if within defined range
 	spamScore := msg.Header.Get("X-Vade-Spamscore")
 	score, err := strconv.Atoi(spamScore)
 	if err != nil {
@@ -92,34 +143,29 @@ func SaveMetaData(user string, r io.Reader, objKey string, size int64, db *gorm.
 
 	// Start transaction
 	tx := db.Begin()
-	if score >= 500 && score <= 9999 {
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	if score >= SpamScoreMin && score <= SpamScoreMax {
 		log.Printf("SPAM detected with score: %d from msg ID: %s", score, msg.Header.Get("Message-ID"))
 		// Save to SPAM folder instead of INBOX if it's SPAM
-		var spamMailbox model.Mailbox
-		// Get ID of SPAM folder
-		if err := tx.Where("user = ? AND name = ?", msg.Header.Get("Delivered-To"), "SPAM").First(&spamMailbox).Error; err != nil {
-			if err == gorm.ErrRecordNotFound {
-				// Create SPAM folder if it doesn't exist
-				spamMailbox = model.Mailbox{
-					Name: "SPAM",
-					User: msg.Header.Get("Delivered-To"),
-				}
-				if err := tx.Create(&spamMailbox).Error; err != nil {
-					tx.Rollback()
-					return fmt.Errorf("error creating SPAM mailbox: %v", err)
-				}
-			} else {
-				tx.Rollback()
-				return fmt.Errorf("error finding SPAM mailbox: %v", err)
-			}
+		spamMailboxID, err := createSpamFolder(tx, msg.Header.Get("Delivered-To"))
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("error creating SPAM folder: %v", err)
 		}
-		mailboxID = spamMailbox.ID // Use SPAM folder ID
+		mailboxID = spamMailboxID // Use SPAM folder ID
 	}
 
 	if user == "" {
 		user = msg.Header.Get("Delivered-To")
 		if user == "" {
-			log.Fatalf("No user specified and no Delivered-To header found")
+			log.Printf("No user specified and no Delivered-To header found")
+			tx.Rollback()
+			return fmt.Errorf("no user specified and no Delivered-To header found")
 		}
 	}
 
